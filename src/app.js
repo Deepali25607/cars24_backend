@@ -4,7 +4,11 @@ const cors = require('cors');
 // Express app without the listener, so tests can mount it on an ephemeral port.
 function buildApp() {
   const app = express();
-  app.use(cors({ origin: process.env.CORS_ORIGIN || 'http://localhost:5173' }));
+  // CORS_ORIGIN accepts a comma-separated list, e.g.
+  // "https://cars24-frontend.vercel.app,http://localhost:5173"
+  const allowedOrigins = (process.env.CORS_ORIGIN || 'http://localhost:5173')
+    .split(',').map((o) => o.trim().replace(/\/+$/, '')).filter(Boolean);
+  app.use(cors({ origin: allowedOrigins }));
   app.use(express.json({ limit: '1mb' }));
   app.set('trust proxy', true);
 
