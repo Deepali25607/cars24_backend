@@ -4,11 +4,21 @@ const cors = require('cors');
 // Express app without the listener, so tests can mount it on an ephemeral port.
 function buildApp() {
   const app = express();
-  // CORS_ORIGIN accepts a comma-separated list, e.g.
-  // "https://cars24-frontend.vercel.app,http://localhost:5173"
-  const allowedOrigins = (process.env.CORS_ORIGIN || 'http://localhost:5173')
-    .split(',').map((o) => o.trim().replace(/\/+$/, '')).filter(Boolean);
-  app.use(cors({ origin: allowedOrigins }));
+  // Known frontends are always allowed; CORS_ORIGIN (or CLIENT_ORIGIN) can add
+  // more as a comma-separated list, e.g. "https://staging.example.com"
+  const allowedOrigins = [
+    'http://localhost:5173',
+    'http://localhost:3000',
+    'https://cars24-frontend.vercel.app',
+    ...(process.env.CORS_ORIGIN || process.env.CLIENT_ORIGIN || '')
+      .split(',').map((o) => o.trim().replace(/\/+$/, '')).filter(Boolean),
+  ];
+  app.use(cors({
+    origin(origin, callback) {
+      if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
+      callback(new Error(`Origin ${origin} not allowed by CORS`));
+    },
+  }));
   app.use(express.json({ limit: '1mb' }));
   app.set('trust proxy', true);
 
