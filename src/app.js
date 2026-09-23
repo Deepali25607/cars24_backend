@@ -38,6 +38,7 @@ function buildApp() {
   app.use('/api/requests', require('./routes/requests.routes'));
   app.use('/api/search', require('./routes/search.routes'));
   app.use('/api/integrations', require('./routes/integrations.routes'));
+  app.use('/api/email', require('./routes/email.routes')); // S10 extension: two-way email channel
   // ADVANCED phase routers (BRD section 8)
   app.use('/api/cmdb', require('./routes/cmdb.routes'));
   app.use('/api/problems', require('./routes/problems.routes'));

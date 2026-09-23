@@ -9,6 +9,9 @@ const { audit, ticketHistory, notifyUser, notifyTicketParties } = require('../se
 const { applySla, recomputeSla, pauseSla, resumeSla, markFirstResponse,
   completeSla, reopenSla, getTicketSla } = require('../sla');
 const { applyAssignmentRules, runWorkflows } = require('../workflow');
+// S10 extension: customer-visible updates on email-sourced tickets are mailed
+// back on the original thread. Internal work notes never trigger a send.
+const emailSync = require('../email/outbound');
 
 const router = express.Router();
 router.use(authenticate);
@@ -161,7 +164,7 @@ router.post('/', (req, res) => {
 
 // ---------- List (role-scoped) ----------
 router.get('/', (req, res) => {
-  const { scope, status, priority_id, category_id, group_id, q } = req.query;
+  const { scope, status, priority_id, category_id, subcategory_id, group_id, q, from, to } = req.query;
   const where = [];
   const params = {};
 
@@ -187,6 +190,10 @@ router.get('/', (req, res) => {
   if (status) { where.push('t.status = @status'); params.status = status; }
   if (priority_id) { where.push('t.priority_id = @prio'); params.prio = priority_id; }
   if (category_id) { where.push('t.category_id = @cat'); params.cat = category_id; }
+  if (subcategory_id) { where.push('t.subcategory_id = @sub'); params.sub = subcategory_id; }
+  // Optional creation-date window (YYYY-MM-DD), used by the Reports data table.
+  if (from && /^\d{4}-\d{2}-\d{2}$/.test(from)) { where.push('date(t.created_at) >= date(@from)'); params.from = from; }
+  if (to && /^\d{4}-\d{2}-\d{2}$/.test(to)) { where.push('date(t.created_at) <= date(@to)'); params.to = to; }
   if (group_id) { where.push('t.support_group_id = @grp'); params.grp = group_id; }
   if (q) {
     where.push('(t.title LIKE @q OR t.ticket_number LIKE @q OR t.description LIKE @q)');
@@ -223,7 +230,11 @@ router.get('/:id', (req, res) => {
     WHERE th.ticket_id = ? ORDER BY th.created_at ASC, th.id ASC`).all(ticket.id);
 
   const rating = db.prepare('SELECT score, comment FROM ticket_ratings WHERE ticket_id = ?').get(ticket.id);
-  res.json({ ...ticket, comments, attachments, history, sla: getTicketSla(ticket.id), rating: rating || null });
+  const related = ticket.related_ticket_id
+    ? db.prepare('SELECT id, ticket_number, status FROM tickets WHERE id = ?').get(ticket.related_ticket_id) : null;
+  const followUps = db.prepare('SELECT id, ticket_number, status FROM tickets WHERE related_ticket_id = ? ORDER BY id').all(ticket.id);
+  res.json({ ...ticket, comments, attachments, history, sla: getTicketSla(ticket.id), rating: rating || null,
+    related_ticket: related, follow_up_tickets: followUps });
 });
 
 // ---------- Assign / reassign ----------
@@ -260,6 +271,7 @@ router.post('/:id/assign', requireRole(...IT_ROLES), (req, res) => {
   runWorkflows('ticket.assigned', updated);
   notifyTicketParties(updated, req.user.id, 'TICKET_ASSIGNED',
     `Ticket ${updated.ticket_number} ${detail.toLowerCase()}.`);
+  emailSync.onAssigned(updated, req.user, detail); // FR7: assignment goes on the email thread (configurable)
   res.json(updated);
 });
 
@@ -280,6 +292,14 @@ router.patch('/:id', requireRole(...IT_ROLES), (req, res) => {
     if (!p) return res.status(400).json({ error: 'Invalid priority' });
     changes.push(`priority → ${p.code}`);
   }
+  if (subcategory_id !== undefined && (subcategory_id || null) !== ticket.subcategory_id) {
+    const sc = subcategory_id ? db.prepare('SELECT name FROM subcategories WHERE id = ?').get(subcategory_id) : null;
+    changes.push(`subcategory → ${sc?.name || '—'}`);
+  }
+  if (location_id && location_id !== ticket.location_id) {
+    const l = db.prepare('SELECT name FROM locations WHERE id = ?').get(location_id);
+    if (l) changes.push(`location → ${l.name}`);
+  }
   db.prepare(`UPDATE tickets SET
       category_id = COALESCE(?, category_id),
       subcategory_id = ?,
@@ -297,6 +317,8 @@ router.patch('/:id', requireRole(...IT_ROLES), (req, res) => {
   }
   // STANDARD S2: priority change re-baselines the SLA targets
   if (priority_id && priority_id !== ticket.priority_id) recomputeSla(getTicket(ticket.id));
+  // FR7: one "details updated" mail on the email thread listing every change (configurable)
+  if (changes.length) emailSync.onDetailsUpdated(getTicket(ticket.id), req.user, changes.join(', '));
   res.json(getTicket(ticket.id));
 });
 
@@ -356,6 +378,8 @@ router.post('/:id/status', (req, res) => {
   };
   notifyTicketParties(updated, req.user.id, `TICKET_${target}`,
     messages[target] || `Ticket ${updated.ticket_number} status changed to ${target.replace('_', ' ')}.`);
+  // Email sync (FR7): on hold / resolved / closed / reopened go back on the thread.
+  if (it) emailSync.onStatusChange(updated, target, note || null, req.user);
   res.json(updated);
 });
 
@@ -388,7 +412,12 @@ router.post('/:id/comments', (req, res) => {
     SELECT tc.*, u.full_name AS author_name, u.role AS author_role
     FROM ticket_comments tc JOIN users u ON u.id = tc.author_id WHERE tc.id = ?`)
     .get(info.lastInsertRowid);
-  res.status(201).json(comment);
+  // Email sync (FR7): every public comment by an IT user goes back on the
+  // customer's thread, so the email chain mirrors the ticket conversation.
+  if (!internal && isITUser(req.user)) {
+    emailSync.onPublicComment(ticket, comment, req.user);
+  }
+  res.status(201).json({ ...comment, emailed: !internal && emailSync.hasEmailThread(ticket) && isITUser(req.user) });
 });
 
 // ---------- Attachments ----------

@@ -1,0 +1,20 @@
+From: Priya Sharma <employee@itsm.local>
+To: itsupport@cars24.com
+Subject: Please install this tool
+Date: Mon, 21 Sep 2026 13:20:00 +0530
+Message-ID: <exe-001@mail.cars24.com>
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="----=_Part_001"
+
+------=_Part_001
+Content-Type: text/plain; charset="UTF-8"
+
+Please install the attached tool on my laptop.
+
+------=_Part_001
+Content-Type: application/octet-stream; name="setup.exe"
+Content-Disposition: attachment; filename="setup.exe"
+Content-Transfer-Encoding: base64
+
+TVqQAAMAAAAEAAAA//8AALgAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+------=_Part_001--

@@ -1,0 +1,10 @@
+From: =?UTF-8?B?4KSw4KWL4KS54KS/4KSk?= <rohit@itsm.local>
+To: itsupport@cars24.com
+Subject: {{SUBJECT_ENCODED}}
+Date: Mon, 21 Sep 2026 13:10:00 +0530
+Message-ID: <utf8-001@mail.cars24.com>
+MIME-Version: 1.0
+Content-Type: text/plain; charset="UTF-8"
+Content-Transfer-Encoding: base64
+
+{{BODY_B64}}

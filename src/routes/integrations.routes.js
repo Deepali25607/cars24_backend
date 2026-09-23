@@ -5,7 +5,7 @@ const { authenticate, requireRole } = require('../auth');
 const { audit, ticketHistory, notifyUser } = require('../services');
 const { applySla } = require('../sla');
 const { applyAssignmentRules, runWorkflows } = require('../workflow');
-const { processInboundEmail, mailPollerEnabled } = require('../mailin');
+const { processInboundEmail, mailPollerEnabled, listenerStatus } = require('../mailin');
 
 const router = express.Router();
 
@@ -58,18 +58,22 @@ router.post('/tokens/:id/revoke', authenticate, requireRole('ADMIN'), (req, res)
 // otherwise a new incident is created for the sender (matched by email).
 // Live mailbox polling is enabled once the customer provides mailbox
 // credentials (MAIL_IN_* env) — see docs; the processing path is identical.
-router.post('/inbound-email', apiTokenAuth, (req, res) => {
-  const { http, payload } = processInboundEmail(req.body || {});
-  res.status(http).json(payload);
+router.post('/inbound-email', apiTokenAuth, async (req, res, next) => {
+  try {
+    const { http, payload } = await processInboundEmail(req.body || {});
+    res.status(http).json(payload);
+  } catch (err) { next(err); }
 });
 
-// Mailbox poller status (admin) — live polling starts when MAIL_IN_* is set.
+// Mailbox listener status (admin) — live IMAP starts when MAIL_IN_* is set.
 router.get('/mailbox', authenticate, requireRole('ADMIN'), (_req, res) => {
+  const status = listenerStatus();
   res.json({
     polling_enabled: mailPollerEnabled(),
     host: process.env.MAIL_IN_HOST || null,
+    listener: status,
     note: mailPollerEnabled() ? undefined
-      : 'Set MAIL_IN_HOST, MAIL_IN_USER and MAIL_IN_PASS (customer mailbox) to enable live email-to-ticket polling. The relay endpoint above works regardless.',
+      : 'Set MAIL_IN_HOST, MAIL_IN_USER and MAIL_IN_PASS (customer mailbox) to enable live email-to-ticket. The relay endpoint above works regardless.',
   });
 });
 
@@ -142,8 +146,13 @@ router.get('/events', authenticate, requireRole('ADMIN'), (_req, res) => {
 });
 
 // Inbound email log (admin)
+// Kept for backward compatibility; the full log lives under /api/email/log.
 router.get('/inbound-email', authenticate, requireRole('ADMIN'), (_req, res) => {
-  res.json(db.prepare('SELECT * FROM inbound_emails ORDER BY created_at DESC LIMIT 200').all());
+  res.json(db.prepare(`
+    SELECT l.id, l.from_address AS from_email, l.subject, l.processing_status AS status,
+           l.ignore_reason AS error, l.event_type, l.ticket_id, t.ticket_number, l.created_at
+    FROM email_message_log l LEFT JOIN tickets t ON t.id = l.ticket_id
+    WHERE l.direction = 'INBOUND' ORDER BY l.id DESC LIMIT 200`).all());
 });
 
 // ================= S14: SSO status (config-driven, off until IdP details provided) =================

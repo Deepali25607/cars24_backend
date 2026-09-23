@@ -1,9 +1,10 @@
 require('dotenv').config();
 
-const { seed, seedStandard, seedAdvanced } = require('./src/seed');
+const { seed, seedStandard, seedAdvanced, seedEmailChannel } = require('./src/seed');
 seed();
 seedStandard();
 seedAdvanced();
+seedEmailChannel();
 
 const { buildApp } = require('./src/app');
 const app = buildApp();
@@ -20,7 +21,10 @@ const { runDueJobs } = require('./src/workflow');
 // BRD 6.14: automated database backup (daily by default; see src/backup.js)
 require('./src/backup').startBackupTimer();
 
-// STANDARD S10 → live mailbox poller (activates only when MAIL_IN_* is configured)
+// STANDARD S10 (extended): email channel job worker (inbound processing +
+// outbound threaded replies with retries) and the live IMAP listener, which
+// activates only when MAIL_IN_* is configured.
+require('./src/email/queue').startWorker(Number(process.env.EMAIL_WORKER_SECONDS || 30));
 require('./src/mailin').startMailPoller();
 
 const sweepSeconds = Number(process.env.SLA_SWEEP_SECONDS || 60);

@@ -1,9 +1,46 @@
 const express = require('express');
 const { db } = require('../db');
 const { authenticate, requireRole, IT_ROLES } = require('../auth');
+const { reportInsights } = require('../dashboard');
+const { catalog, buildReport, renderReport } = require('../reportBuilder');
+const { audit } = require('../services');
 
 const router = express.Router();
 router.use(authenticate);
+
+// ---------- Report generator ----------
+// GET /reports/catalog → available report types.
+// GET /reports/generate?type=&from=&to=&group_id=&priority_id=&category_id=&status=&format=json|csv|xlsx|pdf
+router.get('/catalog', requireRole(...IT_ROLES), (_req, res) => res.json(catalog()));
+
+router.get('/generate', requireRole(...IT_ROLES), async (req, res, next) => {
+  try {
+    const rep = buildReport(req.user, req.query);
+    const format = String(req.query.format || 'json').toLowerCase();
+    if (format === 'json') return res.json(rep);
+    const { buffer, mime, filename } = await renderReport(rep, format);
+    audit(req.user.id, 'REPORT_EXPORTED', 'report', rep.type, `${format} ${rep.period.from}..${rep.period.to} (${rep.row_count} rows)`, req);
+    res.setHeader('Content-Type', mime);
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.setHeader('Content-Length', buffer.length);
+    res.send(buffer);
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message });
+    next(err);
+  }
+});
+
+// Reports workspace insights (agent workload, group performance, backlog,
+// resolution/SLA trends, service metrics). Query: from, to, group_id,
+// category_id, priority_id, status. Same role scope as /reports/dashboard.
+router.get('/insights', requireRole(...IT_ROLES), (req, res) => {
+  try {
+    res.json(reportInsights(req.user, req.query));
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message });
+    throw err;
+  }
+});
 
 // Per-role dashboard numbers.
 router.get('/dashboard', (req, res) => {

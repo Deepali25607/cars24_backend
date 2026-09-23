@@ -1,0 +1,14 @@
+From: Priya Sharma <employee@itsm.local>
+To: IT Support <itsupport@cars24.com>
+Subject: Re: Laptop not charging [{{INC}}]
+Date: Mon, 21 Sep 2026 14:00:00 +0530
+Message-ID: <html-001@mail.cars24.com>
+MIME-Version: 1.0
+Content-Type: text/html; charset="UTF-8"
+
+<html><body>
+<div dir="ltr">The <b>replacement charger</b> works, thank you!<br>You can close this.</div>
+<script>alert('xss')</script>
+<div class="gmail_quote">On Mon, 21 Sep 2026 at 13:30, IT Service Desk &lt;itsupport@cars24.com&gt; wrote:<br>
+<blockquote class="gmail_quote">We have sent a replacement charger.</blockquote></div>
+</body></html>

@@ -340,18 +340,8 @@ CREATE TABLE IF NOT EXISTS workflow_jobs (
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
--- S10: email-to-ticket
-CREATE TABLE IF NOT EXISTS inbound_emails (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  message_id TEXT UNIQUE,
-  from_email TEXT NOT NULL,
-  subject TEXT,
-  body TEXT,
-  ticket_id INTEGER REFERENCES tickets(id),
-  status TEXT NOT NULL DEFAULT 'PROCESSED',
-  error TEXT,
-  created_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
+-- S10: email-to-ticket — inbound_emails was replaced by email_message_log
+-- (see the email-channel block below; legacy rows are migrated on boot).
 
 -- S12: saved searches
 CREATE TABLE IF NOT EXISTS saved_searches (
@@ -581,6 +571,181 @@ ensureColumn('tickets', 'is_major', 'is_major INTEGER NOT NULL DEFAULT 0');
 ensureColumn('tickets', 'major_commander_id', 'major_commander_id INTEGER REFERENCES users(id)');
 ensureColumn('tickets', 'major_bridge', 'major_bridge TEXT');
 ensureColumn('tickets', 'major_declared_at', 'major_declared_at TEXT');
+
+// ================= Email channel (S10 extension: two-way email sync) =================
+// Ticket/comment provenance columns (additive, default to portal behaviour).
+ensureColumn('tickets', 'source', "source TEXT NOT NULL DEFAULT 'PORTAL'");
+ensureColumn('tickets', 'original_message_id', 'original_message_id TEXT');
+ensureColumn('tickets', 'thread_subject', 'thread_subject TEXT');
+ensureColumn('tickets', 'caller_email', 'caller_email TEXT');
+ensureColumn('tickets', 'caller_unverified', 'caller_unverified INTEGER NOT NULL DEFAULT 0');
+ensureColumn('tickets', 'cc_list', 'cc_list TEXT');
+ensureColumn('tickets', 'related_ticket_id', 'related_ticket_id INTEGER REFERENCES tickets(id)');
+ensureColumn('ticket_comments', 'source', "source TEXT NOT NULL DEFAULT 'PORTAL'");
+ensureColumn('ticket_comments', 'sender_email', 'sender_email TEXT');
+ensureColumn('ticket_comments', 'email_log_id', 'email_log_id INTEGER');
+ensureColumn('ticket_comments', 'external_participant', 'external_participant INTEGER NOT NULL DEFAULT 0');
+
+db.exec(`
+CREATE TABLE IF NOT EXISTS email_message_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ticket_id INTEGER REFERENCES tickets(id),
+  message_id TEXT UNIQUE,
+  in_reply_to TEXT,
+  references_header TEXT,
+  direction TEXT NOT NULL CHECK (direction IN ('INBOUND','OUTBOUND')),
+  from_address TEXT,
+  from_name TEXT,
+  to_addresses TEXT,
+  cc_addresses TEXT,
+  subject TEXT,
+  body_text TEXT,
+  body_html_raw TEXT,
+  received_or_sent_at TEXT,
+  processing_status TEXT NOT NULL DEFAULT 'PROCESSED'
+    CHECK (processing_status IN ('PENDING','PROCESSED','IGNORED','QUARANTINED','FAILED','DISCARDED')),
+  ignore_reason TEXT,
+  event_type TEXT,
+  raw_headers TEXT,
+  raw_source TEXT,
+  attachments_json TEXT,
+  auth_results TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_email_log_ticket ON email_message_log(ticket_id, id);
+CREATE INDEX IF NOT EXISTS idx_email_log_status ON email_message_log(processing_status, direction);
+CREATE INDEX IF NOT EXISTS idx_email_log_from ON email_message_log(from_address, created_at);
+CREATE INDEX IF NOT EXISTS idx_email_log_reply ON email_message_log(in_reply_to);
+
+CREATE TABLE IF NOT EXISTS email_classification_rules (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  category_id INTEGER NOT NULL REFERENCES categories(id),
+  subcategory_id INTEGER REFERENCES subcategories(id),
+  keyword TEXT NOT NULL,
+  weight INTEGER NOT NULL DEFAULT 1,
+  assignment_group_id INTEGER REFERENCES support_groups(id),
+  default_priority_id INTEGER REFERENCES priorities(id),
+  is_active INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS email_templates (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_type TEXT NOT NULL UNIQUE
+    CHECK (event_type IN ('ACK','COMMENT','ON_HOLD','RESOLVED','CLOSED','REOPENED','PRIORITY','GROUP')),
+  subject_template TEXT NOT NULL,
+  body_html_template TEXT NOT NULL,
+  body_text_template TEXT NOT NULL,
+  is_active INTEGER NOT NULL DEFAULT 1,
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS email_channel_config (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  enabled INTEGER NOT NULL DEFAULT 1,
+  mailbox_address TEXT,
+  system_addresses TEXT,
+  allowed_domains TEXT,
+  unknown_sender_action TEXT NOT NULL DEFAULT 'QUARANTINE'
+    CHECK (unknown_sender_action IN ('QUARANTINE','REJECT')),
+  auth_check_mode TEXT NOT NULL DEFAULT 'QUARANTINE_FAIL'
+    CHECK (auth_check_mode IN ('OFF','QUARANTINE_FAIL')),
+  polling_interval_seconds INTEGER NOT NULL DEFAULT 60,
+  reopen_window_days INTEGER NOT NULL DEFAULT 7,
+  max_attachment_mb INTEGER NOT NULL DEFAULT 10,
+  max_total_attachment_mb INTEGER NOT NULL DEFAULT 25,
+  attachment_violation_action TEXT NOT NULL DEFAULT 'QUARANTINE'
+    CHECK (attachment_violation_action IN ('QUARANTINE','STRIP')),
+  inline_image_min_kb INTEGER NOT NULL DEFAULT 10,
+  rate_limit_per_hour INTEGER NOT NULL DEFAULT 10,
+  triage_group_id INTEGER REFERENCES support_groups(id),
+  general_category_id INTEGER REFERENCES categories(id),
+  subject_weight INTEGER NOT NULL DEFAULT 2,
+  body_weight INTEGER NOT NULL DEFAULT 1,
+  notify_on_priority_change INTEGER NOT NULL DEFAULT 0,
+  notify_on_group_change INTEGER NOT NULL DEFAULT 0,
+  portal_url TEXT,
+  processed_folder TEXT NOT NULL DEFAULT 'Processed',
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS email_jobs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind TEXT NOT NULL CHECK (kind IN ('INBOUND','OUTBOUND')),
+  message_id TEXT,
+  payload_json TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'QUEUED'
+    CHECK (status IN ('QUEUED','RUNNING','DONE','DEAD','DISCARDED')),
+  attempts INTEGER NOT NULL DEFAULT 0,
+  max_attempts INTEGER NOT NULL DEFAULT 5,
+  next_run_at TEXT NOT NULL DEFAULT (datetime('now')),
+  last_error TEXT,
+  result_json TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_email_jobs_due ON email_jobs(status, next_run_at);
+`);
+
+// Templates still at their shipped default are refreshed when defaults evolve;
+// admin-edited ones (is_default = 0) are left alone.
+ensureColumn('email_templates', 'is_default', 'is_default INTEGER NOT NULL DEFAULT 1');
+// Which ticket actions are mailed to the caller on the thread (all on by default).
+ensureColumn('email_channel_config', 'notify_on_assignment', 'notify_on_assignment INTEGER NOT NULL DEFAULT 1');
+ensureColumn('email_channel_config', 'notify_on_update', 'notify_on_update INTEGER NOT NULL DEFAULT 1');
+ensureColumn('email_channel_config', 'notify_on_progress', 'notify_on_progress INTEGER NOT NULL DEFAULT 1');
+// 0 = agents/leads get in-app notifications only (one mail chain per incident);
+// 1 = they also receive a copy on the incident's thread.
+ensureColumn('email_channel_config', 'thread_internal_notifications', 'thread_internal_notifications INTEGER NOT NULL DEFAULT 0');
+// 1 = the assigned agent is CC'd on every thread mail to the caller.
+ensureColumn('email_channel_config', 'cc_assigned_agent', 'cc_assigned_agent INTEGER NOT NULL DEFAULT 1');
+
+// The event-type CHECK on email_templates was too narrow once assignment /
+// progress / update / internal-notification events were added: rebuild the
+// table without it (validation lives in src/email/templates.js). Idempotent.
+(function migrateEmailTemplates() {
+  const row = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'email_templates'").get();
+  if (!row || !/CHECK\s*\(\s*event_type IN/i.test(row.sql)) return;
+  db.exec(`
+    ALTER TABLE email_templates RENAME TO email_templates_legacy;
+    CREATE TABLE email_templates (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      event_type TEXT NOT NULL UNIQUE,
+      subject_template TEXT NOT NULL,
+      body_html_template TEXT NOT NULL,
+      body_text_template TEXT NOT NULL,
+      is_active INTEGER NOT NULL DEFAULT 1,
+      is_default INTEGER NOT NULL DEFAULT 1,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    INSERT INTO email_templates (id, event_type, subject_template, body_html_template, body_text_template, is_active, is_default, updated_at)
+      SELECT id, event_type, subject_template, body_html_template, body_text_template, is_active, is_default, updated_at
+      FROM email_templates_legacy;
+    DROP TABLE email_templates_legacy;
+  `);
+  console.log('[migrate] rebuilt email_templates without the event_type CHECK');
+})();
+
+// One-time migration: the Standard-phase inbound_emails table is replaced by
+// email_message_log. Copy rows across (skipping duplicates) and drop the table.
+(function migrateInboundEmails() {
+  const legacy = db.prepare(
+    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'inbound_emails'"
+  ).get();
+  if (!legacy) return;
+  const rows = db.prepare('SELECT * FROM inbound_emails ORDER BY id').all();
+  const statusMap = { CREATED: 'PROCESSED', THREADED: 'PROCESSED', REJECTED: 'QUARANTINED', FAILED: 'FAILED' };
+  const ins = db.prepare(`INSERT OR IGNORE INTO email_message_log
+    (ticket_id, message_id, direction, from_address, subject, body_text, received_or_sent_at,
+     processing_status, ignore_reason, event_type, created_at)
+    VALUES (?,?,'INBOUND',?,?,?,?,?,?,?,?)`);
+  for (const r of rows) {
+    ins.run(r.ticket_id, r.message_id, r.from_email, r.subject, r.body, r.created_at,
+      statusMap[r.status] || 'PROCESSED', r.error, r.status, r.created_at);
+  }
+  db.exec('DROP TABLE inbound_emails');
+  if (rows.length) console.log(`[migrate] moved ${rows.length} inbound_emails row(s) to email_message_log`);
+})();
 
 // Repair migration (DEF-A-001): databases booted against a pre-release
 // intermediate build have request_approvals without approver_role (and with

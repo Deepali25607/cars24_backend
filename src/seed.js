@@ -215,4 +215,33 @@ function seedAdvanced() {
   }
 }
 
-module.exports = { seed, seedStandard, seedAdvanced };
+// ================= Email channel seed (S10 extension, idempotent) =================
+// General category + Service Desk Triage group (classifier fallback), the
+// guest requester for unverified senders, keyword rules, templates, config.
+function seedEmailChannel() {
+  if (!db.prepare("SELECT id FROM categories WHERE name = 'General'").get()) {
+    db.prepare("INSERT INTO categories (name, icon) VALUES ('General', 'inbox')").run();
+  }
+  if (!db.prepare("SELECT id FROM support_groups WHERE name = 'Service Desk Triage'").get()) {
+    db.prepare("INSERT INTO support_groups (name, description) VALUES ('Service Desk Triage', 'First-line triage for unclassified email requests')").run();
+  }
+  require('./email/pipeline').getGuestUser();
+  require('./email/classifier').seedClassificationRules();
+  require('./email/templates').ensureTemplates();
+  require('./email/config').getConfig();
+  // One-time default change (2026-09-22): agents/leads are no longer emailed
+  // about threaded tickets (in-app only) so each incident has one mail chain.
+  if (!db.prepare("SELECT value FROM settings WHERE key = 'email_agent_mail_default_v2'").get()) {
+    db.prepare('UPDATE email_channel_config SET thread_internal_notifications = 0 WHERE id = 1').run();
+    db.prepare("INSERT INTO settings (key, value) VALUES ('email_agent_mail_default_v2', '1')").run();
+  }
+  // Backfill: portal tickets that already received email comments get their
+  // thread enabled so agent updates are mailed back (idempotent).
+  db.prepare(`UPDATE tickets SET
+      thread_subject = title,
+      caller_email = COALESCE(caller_email, (SELECT email FROM users WHERE users.id = tickets.requester_id))
+    WHERE thread_subject IS NULL AND source = 'PORTAL'
+      AND EXISTS (SELECT 1 FROM ticket_comments c WHERE c.ticket_id = tickets.id AND c.source = 'EMAIL')`).run();
+}
+
+module.exports = { seed, seedStandard, seedAdvanced, seedEmailChannel };
