@@ -7,6 +7,7 @@ const { applySla, reopenSla } = require('../sla');
 const { applyAssignmentRules, runWorkflows } = require('../workflow');
 const parser = require('./parser');
 const { matchThread } = require('./threadMatcher');
+const participants = require('./participants');
 const { getClassifier } = require('./classifier');
 const { getConfig } = require('./config');
 const antivirus = require('./antivirus');
@@ -142,31 +143,15 @@ async function saveAttachments(ticketId, uploaderId, atts) {
   return { saved, rejected };
 }
 
-function senderIsParticipant(ticket, address, user) {
+function senderIsParticipant(ticket, address, user, config) {
   if (!address) return false;
   if (ticket.caller_email && ticket.caller_email.toLowerCase() === address) return true;
   if (user && ticket.requester_id === user.id) return true;
   if (user && ['AGENT', 'TEAM_LEAD', 'ADMIN'].includes(user.role)) return true;
-  try {
-    const cc = JSON.parse(ticket.cc_list || '[]').map((s) => String(s).toLowerCase());
-    if (cc.includes(address)) return true;
-  } catch { /* ignore */ }
-  return false;
-}
-
-function mergeCc(ticket, msg, config) {
-  let cc = [];
-  try { cc = JSON.parse(ticket.cc_list || '[]'); } catch { cc = []; }
-  const set = new Set(cc.map((s) => String(s).toLowerCase()));
-  // IT staff are copied through the assignment (recipientsFor), not the watch list,
-  // so a reply-all from the customer does not pin a former assignee to the ticket.
-  const isStaff = (address) => !!db.prepare("SELECT id FROM users WHERE email = ? AND role IN ('AGENT','TEAM_LEAD','ADMIN')").get(address);
-  for (const a of msg.cc || []) if (!config.systemAddresses.has(a.address) && !isStaff(a.address)) set.add(a.address);
-  for (const a of msg.to || []) if (!config.systemAddresses.has(a.address) && !isStaff(a.address)) set.add(a.address);
-  const caller = (ticket.caller_email || '').toLowerCase();
-  set.delete(caller);
-  const next = JSON.stringify([...set]);
-  if (next !== ticket.cc_list) db.prepare('UPDATE tickets SET cc_list = ? WHERE id = ?').run(next, ticket.id);
+  // Written from the shared support mailbox: that is the service desk itself,
+  // not an outside party writing in.
+  if (config && config.systemAddresses.has(address)) return true;
+  return participants.listParticipants(ticket).includes(address);
 }
 
 function withinReopenWindow(ticket, days) {
@@ -200,6 +185,18 @@ async function processInboundEmail(input, opts = {}) {
     elog.info('inbound.duplicate', { message_id: mid, status: existing.processing_status });
     return { http: 200, payload: { ok: true, duplicate: true, ticket_id: existing.ticket_id, log_id: existing.id } };
   }
+  // One of our own outbound messages landing back in the mailbox: the loop stops
+  // here, before the log row is opened (message_id is unique, so re-logging it
+  // would fail). This is what makes it safe to accept mail whose From is the
+  // support mailbox itself — see the FR8 block below.
+  if (!force) {
+    const ours = db.prepare("SELECT id FROM email_message_log WHERE message_id = ? AND direction = 'OUTBOUND'").get(mid);
+    if (ours) {
+      elog.inc('ignored');
+      elog.info('inbound.ignored', { message_id: mid, from, reason: 'own outbound message returned' });
+      return { http: 202, payload: { ok: false, ignored: true, log_id: ours.id, reason: 'Our own outbound message came back — loop prevented' } };
+    }
+  }
   const logId = openLogRow(msg, opts.logId || existing?.id || null);
   const config = getConfig();
 
@@ -215,7 +212,6 @@ async function processInboundEmail(input, opts = {}) {
 
     // ---- FR8: loop & noise prevention ----
     if (!force) {
-      if (config.systemAddresses.has(from)) return finish('IGNORED', 'Sent from the support mailbox / a system address', {}, 202, { ignored: true });
       // Bounces first: NDRs usually also carry Auto-Submitted, but we want them
       // linked to the incident whose mail bounced.
       const bounce = parser.isBounce(msg);
@@ -289,7 +285,7 @@ async function processInboundEmail(input, opts = {}) {
           runWorkflows('ticket.status.REOPENED', ticket);
           reopened = true;
         }
-        const external = !senderIsParticipant(ticket, from, user) ? 1 : 0;
+        const external = !senderIsParticipant(ticket, from, user, config) ? 1 : 0;
         // First email on a portal-created ticket starts its email thread: from
         // now on agent updates are mailed back on it (see outbound.shouldSync).
         if (!ticket.thread_subject) {
@@ -305,7 +301,12 @@ async function processInboundEmail(input, opts = {}) {
           .run(ticket.id, author.id, cleaned + strippedNote, from, logId, external);
         db.prepare("UPDATE tickets SET updated_at = datetime('now') WHERE id = ?").run(ticket.id);
         ticketHistory(ticket.id, user?.id ?? null, 'COMMENT', `Comment added via email from ${from}${external ? ' (external participant)' : ''}`);
-        if (!external) mergeCc(ticket, msg, config);
+        // Link this message to the incident before anything else mails out on the
+        // thread, so the catch-up below chains to the mail that added the newcomers.
+        db.prepare('UPDATE email_message_log SET ticket_id = ? WHERE id = ?').run(ticket.id, logId);
+        // Everyone the sender put in To/Cc joins the watch list: the new ones get
+        // the conversation so far and stay on the chain from here on.
+        if (!external) participants.syncFromInbound(ticket, msg, config, { actorId: user?.id ?? null, sender: from });
         const files = await saveAttachments(ticket.id, author.id, policy.keep);
         if (files.saved.length) ticketHistory(ticket.id, user?.id ?? null, 'ATTACHMENT', `Email attachment(s): ${files.saved.join(', ')}`);
         audit(user?.id ?? null, 'EMAIL_THREADED', 'ticket', ticket.id, `${ticket.ticket_number} via ${match.via}`);
@@ -325,6 +326,11 @@ async function processInboundEmail(input, opts = {}) {
     }
 
     // =============== NEW incident (FR3/FR4/FR5) ===============
+    // Someone writing from the shared mailbox may join an existing thread, but
+    // the support mailbox must never raise incidents out of its own outgoing mail.
+    if (!force && config.systemAddresses.has(from)) {
+      return finish('IGNORED', 'Sent from the support mailbox and does not reference an existing incident', {}, 202, { ignored: true });
+    }
     if (!force) {
       const recent = db.prepare(`SELECT COUNT(*) AS n FROM email_message_log
         WHERE direction = 'INBOUND' AND from_address = ? AND event_type IN ('CREATED','LINKED')

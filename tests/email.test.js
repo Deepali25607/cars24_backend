@@ -209,6 +209,11 @@ test('EM-7 agent public comment → threaded email to caller with correct subjec
   assert.match(m.text, /Also, the charger LED is now blinking orange\./);
   assert.match(m.text, /It still does not charge after trying a different socket\./);
   assert.equal((m.text.match(/We are sending a replacement charger today\./g) || []).length, 1, 'new comment is not repeated inside the history');
+  // Mail-trail order: the update being sent is at the top, then the incident
+  // details, then the history with the newest exchange first.
+  assert.ok(m.text.indexOf('We are sending a replacement charger today.') < m.text.indexOf('Conversation so far'), 'the new comment leads the message');
+  assert.ok(m.text.indexOf('Incident: ') < m.text.indexOf('Conversation so far'), 'incident details sit above the history');
+  assert.ok(m.text.indexOf('blinking orange') < m.text.indexOf('Original request'), 'latest exchange first, original request last');
   assert.match(m.html, /Conversation so far/);
   assert.match(m.html, /blinking orange/);
   // Only the threaded email, not a second generic notification
@@ -358,10 +363,12 @@ test('EM-10 out-of-office, own-mailbox and bounce messages are ignored — no ti
   const ooo = await inboundEml('06-out-of-office.eml', { INC: ctx.sw.ticket_number, ACK_ID: ctx.ackId });
   assert.equal(ooo.status, 202);
   assert.equal(ooo.data.ignored, true);
+  // A copy of our own outbound mail carries the headers we set on it, so it is
+  // recognised as machine-generated and never threaded back onto the incident.
   const self = await inboundEml('07-own-mailbox.eml', { INC: ctx.sw.ticket_number });
   assert.equal(self.status, 202);
   assert.equal(self.data.ignored, true);
-  assert.match(self.data.reason, /support mailbox/);
+  assert.match(self.data.reason, /Auto-Submitted/);
   const ndr = await inboundEml('14-bounce.eml', { INC: ctx.hw.ticket_number, ACK_ID: ctx.ackId });
   assert.equal(ndr.status, 202);
   assert.equal(ndr.data.ignored, true);
@@ -555,9 +562,9 @@ test('EM-16 admin API: config, rules, templates, log filters; employees forbidde
 
   // templates
   const tpl = await api('/api/email/templates', { token: tokens.admin });
-  assert.equal(tpl.data.templates.length, 10);
+  assert.equal(tpl.data.templates.length, 11);
   assert.deepEqual(tpl.data.templates.map((t) => t.event_type).sort(),
-    ['ACK', 'ASSIGNED', 'CLOSED', 'COMMENT', 'IN_PROGRESS', 'NOTIFY', 'ON_HOLD', 'REOPENED', 'RESOLVED', 'UPDATED']);
+    ['ACK', 'ASSIGNED', 'CLOSED', 'COMMENT', 'IN_PROGRESS', 'NOTIFY', 'ON_HOLD', 'REOPENED', 'RESOLVED', 'THREAD_ADDED', 'UPDATED']);
   assert.ok(tpl.data.placeholders.includes('incident_number'));
   const put = await api('/api/email/templates/ACK', { method: 'PUT', token: tokens.admin, body: { body_text_template: 'Hi {{caller_name}}, {{incident_number}} created. {{portal_link}}' } });
   assert.equal(put.status, 200);
@@ -696,6 +703,37 @@ test('EM-20 mail without a Message-ID still yields one chain: replies reference 
   assert.equal(lastMail().references, `${ack.messageId} ${m.messageId} ${started.messageId}`);
 });
 
+test('EM-21 production diagnostics: settings checklist, SMTP test, IMAP test report actionable errors', async () => {
+  const st = await api('/api/email/status', { token: tokens.admin });
+  assert.equal(st.status, 200);
+  assert.equal(st.data.env.mailbox_address, MAILBOX);
+  assert.deepEqual(st.data.env.allowed_domains, ['cars24.com']);
+  assert.equal(typeof st.data.env.SMTP_HOST, 'boolean');
+  const denied = await api('/api/email/test/smtp', { method: 'POST', token: tokens.employee, body: {} });
+  assert.equal(denied.status, 403);
+  // no SMTP_HOST in the test environment → explains itself instead of failing silently
+  const smtp = await api('/api/email/test/smtp', { method: 'POST', token: tokens.admin, body: { to: 'admin@itsm.local' } });
+  assert.equal(smtp.status, 400);
+  assert.match(smtp.data.error, /SMTP_HOST is not set/);
+  const bad = await api('/api/email/test/smtp', { method: 'POST', token: tokens.admin, body: { to: 'nope' } });
+  assert.equal(bad.status, 400);
+  // no MAIL_IN_* in the test environment → lists exactly what is missing
+  const imap = await api('/api/email/test/imap', { method: 'POST', token: tokens.admin, body: {} });
+  assert.equal(imap.status, 400);
+  assert.match(imap.data.error, /MAIL_IN_HOST, MAIL_IN_USER, MAIL_IN_PASS/);
+  // with credentials pointing at a closed port the IMAP error is reported, not thrown
+  process.env.MAIL_IN_HOST = '127.0.0.1'; process.env.MAIL_IN_PORT = '1'; process.env.MAIL_IN_SECURE = 'false';
+  process.env.MAIL_IN_USER = 'x@y'; process.env.MAIL_IN_PASS = 'z';
+  try {
+    const r = await api('/api/email/test/imap', { method: 'POST', token: tokens.admin, body: {} });
+    assert.equal(r.status, 200);
+    assert.equal(r.data.ok, false);
+    assert.ok(r.data.error, 'error message present');
+  } finally {
+    for (const k of ['MAIL_IN_HOST', 'MAIL_IN_PORT', 'MAIL_IN_SECURE', 'MAIL_IN_USER', 'MAIL_IN_PASS']) delete process.env[k];
+  }
+});
+
 test('EM-19 parser unit checks: prefixes, tokens, quote stripping variants, references truncation', () => {
   assert.equal(parser.cleanSubject('AW: SV: Re[2]: Drucker kaputt [INC-001001]'), 'Drucker kaputt');
   assert.deepEqual(parser.extractTokens('[inc-000012] and INC-000013 and INC000014'), ['INC-000012', 'INC-000013', 'INC-000014']);
@@ -709,4 +747,191 @@ test('EM-19 parser unit checks: prefixes, tokens, quote stripping variants, refe
   const h = buildThreadHeaders(ctx.hw.id);
   assert.equal(h.references[0], '<hw-001@mail.cars24.com>');
   assert.ok(h.references.join(' ').length <= 998);
+});
+
+// ---------------- 22–23: email participants (CC watch list) ----------------
+
+test('EM-22 addresses typed into Cc on a reply join the thread: catch-up mail with the whole trail, copied from then on', async () => {
+  clearOutbox();
+  const r = await inbound({
+    message_id: '<cc-001@mail.cars24.com>',
+    from_email: 'employee@itsm.local',
+    to: [MAILBOX],
+    subject: 'VPN client keeps disconnecting',
+    body: 'The VPN drops every few minutes since this morning.',
+  });
+  assert.equal(r.status, 201, JSON.stringify(r.data));
+  const t = ticketByNumber(r.data.ticket_number);
+  assert.deepEqual(JSON.parse(t.cc_list || '[]'), []);
+  const agentId = db.prepare("SELECT id FROM users WHERE email = 'agent@itsm.local'").get().id;
+  await api(`/api/tickets/${t.id}/assign`, { method: 'POST', token: tokens.admin, body: { agent_id: agentId } });
+  await runEmailJobs();
+  assert.ok(lastMail().cc.includes('agent@itsm.local'), 'the assignment copies the agent automatically');
+
+  // The caller replies and types three more addresses in — outsiders and the
+  // team lead alike. What the headers say is what the ticket says.
+  clearOutbox();
+  const reply = await inbound({
+    message_id: '<cc-002@mail.cars24.com>',
+    from_email: 'employee@itsm.local',
+    to: [MAILBOX, 'manager@cars24.com'],
+    cc: ['agent@itsm.local', 'lead@itsm.local', 'Nisha <nisha@cars24.com>'],
+    subject: `RE: VPN client keeps disconnecting [${t.ticket_number}]`,
+    body: 'Adding my manager and the network lead.',
+  });
+  assert.equal(reply.status, 201, JSON.stringify(reply.data));
+  assert.deepEqual(JSON.parse(ticketByNumber(t.ticket_number).cc_list),
+    ['agent@itsm.local', 'lead@itsm.local', 'nisha@cars24.com', 'manager@cars24.com']);
+
+  // One catch-up mail, addressed to the newcomers only, carrying the trail so
+  // far. The assigned agent is on the list too but already gets every thread
+  // mail, so no "you have been added" notice goes to them.
+  assert.equal(outbox.length, 1);
+  const catchUp = lastMail();
+  assert.equal(catchUp.to, 'lead@itsm.local, nisha@cars24.com, manager@cars24.com');
+  assert.equal(catchUp.cc, undefined, 'the existing thread is not re-mailed');
+  assert.equal(catchUp.subject, `RE: VPN client keeps disconnecting [${t.ticket_number}]`);
+  assert.equal(catchUp.inReplyTo, '<cc-002@mail.cars24.com>');
+  assert.match(catchUp.text, /You have been added \(copied in on the email thread\)/);
+  assert.match(catchUp.text, /The VPN drops every few minutes/);
+  assert.match(catchUp.text, /Adding my manager and the network lead\./);
+  assert.match(catchUp.html, /Conversation so far/);
+
+  // ITSM side: history, audit and an in-app notification for the lead
+  const hist = db.prepare("SELECT detail FROM ticket_history WHERE ticket_id = ? AND action = 'EMAIL_CC_ADDED'").all(t.id);
+  assert.equal(hist.length, 1);
+  assert.match(hist[0].detail, /agent@itsm\.local, lead@itsm\.local, nisha@cars24\.com, manager@cars24\.com were added to the CC list on the email thread/);
+  const leadId = db.prepare("SELECT id FROM users WHERE email = 'lead@itsm.local'").get().id;
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM notifications WHERE user_id = ? AND ticket_id = ? AND type = 'TICKET_CC_ADDED'").get(leadId, t.id).n, 1);
+  assert.ok(db.prepare("SELECT COUNT(*) AS n FROM audit_log WHERE action = 'TICKET_CC_ADDED' AND entity_id = ?").get(String(t.id)).n >= 1);
+
+  // From here on everybody stays on the chain
+  clearOutbox();
+  await api(`/api/tickets/${t.id}/comments`, { method: 'POST', token: tokens.agent, body: { body: 'Rolling out the new VPN client.' } });
+  await runEmailJobs();
+  assert.equal(lastMail().to, 'employee@itsm.local');
+  assert.deepEqual(lastMail().cc, ['agent@itsm.local', 'lead@itsm.local', 'nisha@cars24.com', 'manager@cars24.com']);
+
+  // A plain reply-all from a participant adds nobody and sends no catch-up
+  clearOutbox();
+  await inbound({
+    message_id: '<cc-003@mail.cars24.com>',
+    from_email: 'manager@cars24.com',
+    to: [MAILBOX, 'employee@itsm.local'],
+    cc: ['agent@itsm.local', 'lead@itsm.local'],
+    subject: `RE: VPN client keeps disconnecting [${t.ticket_number}]`,
+    body: 'Thanks for the update.',
+  });
+  assert.deepEqual(JSON.parse(ticketByNumber(t.ticket_number).cc_list),
+    ['agent@itsm.local', 'lead@itsm.local', 'nisha@cars24.com', 'manager@cars24.com']);
+  assert.equal(outbox.length, 0);
+  ctx.vpn = ticketByNumber(t.ticket_number);
+});
+
+test('EM-24 a person writing from the shared support mailbox is threaded; our own mail coming back is not', async () => {
+  const t = ctx.vpn;
+  clearOutbox();
+  // An agent replies from the support mailbox itself (Outlook shared mailbox,
+  // or smtp4dev's Reply dialog) and copies one more colleague.
+  const r = await inbound({
+    message_id: '<cc-004@mailhost.local>',
+    from_email: MAILBOX,
+    to: ['employee@itsm.local'],
+    cc: ['agent2@itsm.local'],
+    subject: `RE: VPN client keeps disconnecting [${t.ticket_number}]`,
+    body: 'Adding Vikram, who owns the VPN gateway.',
+  });
+  assert.equal(r.status, 201, JSON.stringify(r.data));
+  assert.equal(r.data.threaded, true);
+  assert.equal(r.data.external_participant, false, 'the support mailbox is the service desk, not an outsider');
+  const comment = db.prepare('SELECT * FROM ticket_comments WHERE ticket_id = ? ORDER BY id DESC LIMIT 1').get(t.id);
+  assert.match(comment.body, /Adding Vikram, who owns the VPN gateway\./);
+  assert.equal(comment.sender_email, MAILBOX);
+  assert.ok(JSON.parse(ticketByNumber(t.ticket_number).cc_list).includes('agent2@itsm.local'));
+  assert.equal(lastMail().to, 'agent2@itsm.local', 'the newcomer gets the trail');
+
+  // Our own outbound message reflected back into the mailbox is still a loop
+  clearOutbox();
+  const ourId = db.prepare("SELECT message_id FROM email_message_log WHERE ticket_id = ? AND direction = 'OUTBOUND' ORDER BY id DESC LIMIT 1").get(t.id).message_id;
+  const loop = await inbound({
+    message_id: ourId, from_email: MAILBOX, to: ['employee@itsm.local'],
+    subject: `RE: VPN client keeps disconnecting [${t.ticket_number}]`, body: 'echo',
+  });
+  assert.equal(loop.data.ignored, true);
+  assert.match(loop.data.reason, /own outbound message came back/);
+
+  // And the shared mailbox never raises a new incident out of its own mail
+  const before = ticketCount();
+  const fresh = await inbound({
+    message_id: '<cc-005@mailhost.local>', from_email: MAILBOX,
+    to: ['someone@cars24.com'], subject: 'Planned maintenance notice', body: 'FYI only.',
+  });
+  assert.equal(fresh.data.ignored, true);
+  assert.match(fresh.data.reason, /does not reference an existing incident/);
+  assert.equal(ticketCount(), before);
+});
+
+test('EM-23 portal: several addresses go on copy in one step, get the trail, show up in ITSM, and can be taken off', async () => {
+  clearOutbox();
+  const categoryId = db.prepare("SELECT id FROM categories WHERE name = 'Hardware'").get().id;
+  const created = await api('/api/tickets', {
+    method: 'POST', token: tokens.employee,
+    body: { title: 'Monitor flickers', description: 'The second monitor flickers every few seconds.', category_id: categoryId, priority_id: 3 },
+  });
+  assert.equal(created.status, 201, JSON.stringify(created.data));
+  const id = created.data.id;
+
+  const add = await api(`/api/tickets/${id}/participants`, {
+    method: 'POST', token: tokens.agent,
+    body: { emails: 'facilities@cars24.com; Rohit <rohit@itsm.local>, not-an-email' },
+  });
+  await runEmailJobs();
+  assert.equal(add.status, 201, JSON.stringify(add.data));
+  assert.deepEqual(add.data.added, ['facilities@cars24.com', 'rohit@itsm.local']);
+  assert.deepEqual(add.data.skipped.map((s) => s.address), ['not-an-email']);
+  assert.equal(add.data.emailed, true);
+
+  const t = db.prepare('SELECT * FROM tickets WHERE id = ?').get(id);
+  assert.deepEqual(JSON.parse(t.cc_list), ['facilities@cars24.com', 'rohit@itsm.local']);
+  assert.ok(t.thread_subject, 'putting somebody on copy starts the mail thread for a portal ticket');
+  const mail = lastMail();
+  assert.equal(mail.to, 'facilities@cars24.com, rohit@itsm.local');
+  assert.equal(mail.subject, `RE: Monitor flickers [${t.ticket_number}]`);
+  assert.match(mail.text, /You have been added \(added by Sana Qureshi\)/);
+  assert.match(mail.text, /The second monitor flickers every few seconds\./);
+
+  // Same addresses again → nothing to do, explained rather than silently ignored
+  const dup = await api(`/api/tickets/${id}/participants`, { method: 'POST', token: tokens.agent, body: { emails: 'facilities@cars24.com' } });
+  assert.equal(dup.status, 400);
+  assert.match(dup.data.error, /Already on this ticket/);
+  const bad = await api(`/api/tickets/${id}/participants`, { method: 'POST', token: tokens.agent, body: { emails: 'nope' } });
+  assert.equal(bad.status, 400);
+  assert.match(bad.data.error, /Not a valid email address/);
+
+  // Being on the CC list also opens the ticket in the portal for that user
+  const rohit = await login('rohit@itsm.local');
+  const seen = await api(`/api/tickets/${id}`, { token: rohit });
+  assert.equal(seen.status, 200);
+  const mine = await api('/api/tickets', { token: rohit });
+  assert.ok(mine.data.some((x) => x.id === id), 'copied-in employees find the ticket in their list');
+
+  // Removal stops the chain for that address
+  clearOutbox();
+  const del = await api(`/api/tickets/${id}/participants/${encodeURIComponent('rohit@itsm.local')}`, { method: 'DELETE', token: tokens.agent });
+  assert.equal(del.status, 200);
+  assert.deepEqual(del.data.cc, ['facilities@cars24.com']);
+  const gone = await api(`/api/tickets/${id}`, { token: rohit });
+  assert.equal(gone.status, 403);
+  await api(`/api/tickets/${id}/comments`, { method: 'POST', token: tokens.agent, body: { body: 'Replacement monitor ordered.' } });
+  await runEmailJobs();
+  assert.equal(lastMail().to, 'employee@itsm.local');
+  assert.deepEqual(lastMail().cc, ['facilities@cars24.com']);
+  assert.deepEqual(
+    db.prepare("SELECT action FROM ticket_history WHERE ticket_id = ? AND action LIKE 'EMAIL_CC_%' ORDER BY id").all(id).map((h) => h.action),
+    ['EMAIL_CC_ADDED', 'EMAIL_CC_REMOVED'],
+  );
+
+  // An employee who is neither the caller nor on the list cannot touch it
+  const forbidden = await api(`/api/tickets/${id}/participants`, { method: 'POST', token: rohit, body: { emails: 'x@cars24.com' } });
+  assert.equal(forbidden.status, 403);
 });

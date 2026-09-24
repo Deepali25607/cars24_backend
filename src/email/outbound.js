@@ -108,7 +108,11 @@ function conversationHistory(ticket, { excludeCommentId = null, limit = 20 } = {
       when: c.created_at, via: c.source === 'EMAIL' ? 'via Email' : 'via portal', label: null, body: c.body,
     });
   }
-  const shown = entries.slice(-limit);
+  // Most recent `limit` entries, newest first — the way a quoted mail trail
+  // reads: the update being sent is at the top of the message, then the
+  // incident details, then this history with the latest exchange first and the
+  // original request at the bottom.
+  const shown = entries.slice(-limit).reverse();
   const { escapeHtml } = require('./templates');
   const text = shown.map((e) => `${e.label ? `${e.label} — ` : ''}${e.who} · ${fmtIst(e.when)} · ${e.via}\n${String(e.body).slice(0, 2000)}`).join('\n\n');
   const html = shown.map((e) => `<div style="margin:0 0 10px;padding:6px 12px;border-left:3px solid #ddd">
@@ -248,6 +252,39 @@ function onDetailsUpdated(ticket, actor, changes) {
   return sendTicketEmail(ticket.id, 'UPDATED', { comment: changes, agent_name: actor?.full_name });
 }
 
+// Somebody was put on copy (by a reply on the thread, or from the portal):
+// send the newcomers — and only them — the whole conversation so far, on the
+// original thread, so it merges into the chain in their mailbox. From here on
+// they are in cc_list and recipientsFor copies them on every thread mail.
+function sendThreadCatchUp(ticketId, addresses, extra = {}) {
+  const list = [...new Set((addresses || []).map((a) => String(a || '').trim().toLowerCase()).filter(Boolean))];
+  if (!list.length) return null;
+  const ticket = ticketWithNames(ticketId);
+  if (!shouldSync(ticket)) return null;
+  const config = getConfig();
+  const addedBy = extra.via === 'email'
+    ? 'copied in on the email thread'
+    : `added by ${extra.actor_name || 'the IT Service Desk'}`;
+  const rendered = renderTemplate('THREAD_ADDED', templateVars(ticket, {
+    added_by: addedBy, participants: list.join(', '),
+  }));
+  if (!rendered.active) return null;
+  const { inReplyTo, references } = buildThreadHeaders(ticket.id);
+  const messageId = newMessageId(config);
+  const info = db.prepare(`INSERT INTO email_message_log
+    (ticket_id, message_id, in_reply_to, references_header, direction, from_address, to_addresses,
+     cc_addresses, subject, body_text, body_html_raw, processing_status, event_type, raw_headers)
+    VALUES (?,?,?,?,'OUTBOUND',?,?,?,?,?,?,'PENDING','THREAD_ADDED',?)`)
+    .run(ticket.id, messageId, inReplyTo, references.join(' '), config.mailboxAddress || process.env.SMTP_FROM || null,
+      list.join(', '), '', rendered.subject, rendered.text, rendered.html,
+      JSON.stringify({ 'auto-submitted': 'auto-replied' }));
+  const { enqueue, kick } = require('./queue');
+  enqueue('OUTBOUND', { logId: info.lastInsertRowid }, { message_id: messageId });
+  elog.info('outbound.queued', { message_id: messageId, ticket: ticket.ticket_number, event_type: 'THREAD_ADDED', to: list.join(', ') });
+  kick();
+  return db.prepare('SELECT * FROM email_message_log WHERE id = ?').get(info.lastInsertRowid);
+}
+
 // Notification to an agent / lead about a threaded ticket: same subject and
 // headers as the customer chain, addressed to that person only.
 function sendThreadNotification(ticketId, recipient, message) {
@@ -275,5 +312,5 @@ function sendThreadNotification(ticketId, recipient, message) {
 module.exports = {
   sendTicketEmail, deliverOutbound, markOutboundFailed, buildThreadHeaders, recipientsFor,
   templateVars, shouldSync, hasEmailThread, onPublicComment, onStatusChange, onAssigned, onDetailsUpdated,
-  sendThreadNotification,
+  sendThreadNotification, sendThreadCatchUp,
 };

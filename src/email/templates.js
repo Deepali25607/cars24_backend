@@ -10,11 +10,11 @@ const { db } = require('../db');
 
 // One template per ticket action that is mailed on the incident's thread.
 // NOTIFY is the version sent to agents / leads (their in-app notification text).
-const EVENT_TYPES = ['ACK', 'COMMENT', 'ASSIGNED', 'IN_PROGRESS', 'UPDATED', 'ON_HOLD', 'RESOLVED', 'CLOSED', 'REOPENED', 'NOTIFY'];
+const EVENT_TYPES = ['ACK', 'COMMENT', 'ASSIGNED', 'IN_PROGRESS', 'UPDATED', 'ON_HOLD', 'RESOLVED', 'CLOSED', 'REOPENED', 'NOTIFY', 'THREAD_ADDED'];
 const OBSOLETE_TYPES = ['PRIORITY', 'GROUP'];
 const PLACEHOLDERS = ['incident_number', 'caller_name', 'recipient_name', 'short_description', 'description', 'status',
   'assignment_group', 'priority', 'category', 'comment', 'portal_link', 'original_subject', 'agent_name',
-  'resolution_note', 'conversation_history', 'conversation_history_html'];
+  'resolution_note', 'conversation_history', 'conversation_history_html', 'added_by', 'participants'];
 
 const SUBJECT = 'RE: {{original_subject}} [{{incident_number}}]';
 const SUMMARY_TEXT = [
@@ -108,6 +108,18 @@ const DEFAULTS = {
     subject: SUBJECT,
     html: wrapHtml('<p>{{agent_name}} updated the details of your incident <b>{{incident_number}}</b>: {{comment}}.</p>'),
     text: wrapText('{{agent_name}} updated the details of your incident {{incident_number}}: {{comment}}.'),
+  },
+  // Sent to people newly put on copy (and to them only): the whole conversation
+  // so far, on the original thread, so their mail client files it with the chain.
+  THREAD_ADDED: {
+    subject: SUBJECT,
+    html: `<div style="font-family:Segoe UI,Arial,sans-serif;font-size:14px;color:#222">
+<p>Hello,</p>
+<p>You have been added ({{added_by}}) to the email thread of incident <b>{{incident_number}}</b>. The conversation so far is below — reply to this email to take part, and you will be copied on every further update.</p>
+${SUMMARY_HTML}
+${HISTORY_HTML}
+</div>`,
+    text: `Hello,\n\nYou have been added ({{added_by}}) to the email thread of incident {{incident_number}}. The conversation so far is below — reply to this email to take part, and you will be copied on every further update.\n\n${SUMMARY_TEXT}${HISTORY_TEXT}`,
   },
   // Sent to agents / leads (not the caller) so their notifications sit on the same chain.
   NOTIFY: {

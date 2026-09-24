@@ -12,6 +12,8 @@ const { applyAssignmentRules, runWorkflows } = require('../workflow');
 // S10 extension: customer-visible updates on email-sourced tickets are mailed
 // back on the original thread. Internal work notes never trigger a send.
 const emailSync = require('../email/outbound');
+// The ticket's CC watch list: who else follows the incident's email thread.
+const participants = require('../email/participants');
 
 const router = express.Router();
 router.use(authenticate);
@@ -68,6 +70,9 @@ function getTicket(id) {
 function canSeeTicket(user, ticket) {
   if (user.role === 'ADMIN') return true;
   if (ticket.requester_id === user.id) return true;
+  // On the incident's CC list: they already receive the whole email trail, so
+  // they may follow the same conversation in the portal.
+  if (user.email && participants.listParticipants(ticket).includes(user.email.toLowerCase())) return true;
   if (user.role === 'AGENT' || user.role === 'TEAM_LEAD') {
     if (ticket.assigned_agent_id === user.id) return true;
     if (!ticket.support_group_id) return true; // untriaged queue is visible to IT
@@ -168,7 +173,12 @@ router.get('/', (req, res) => {
   const where = [];
   const params = {};
 
-  if (!isITUser(req.user) || scope === 'my') {
+  if (!isITUser(req.user)) {
+    // Employees see what they raised plus what they were copied into by email —
+    // the portal then matches the mail thread they are already on.
+    where.push("(t.requester_id = @uid OR instr(lower(coalesce(t.cc_list, '')), @ccme) > 0)");
+    params.ccme = `"${String(req.user.email || '').toLowerCase()}"`;
+  } else if (scope === 'my') {
     where.push('t.requester_id = @uid');
   } else if (scope === 'assigned') {
     where.push('t.assigned_agent_id = @uid');
@@ -418,6 +428,75 @@ router.post('/:id/comments', (req, res) => {
     emailSync.onPublicComment(ticket, comment, req.user);
   }
   res.status(201).json({ ...comment, emailed: !internal && emailSync.hasEmailThread(ticket) && isITUser(req.user) });
+});
+
+// ---------- Email participants (CC watch list) ----------
+// Several addresses can be put on copy in one go ("a@x.com, b@y.com"). Each new
+// one is mailed the conversation so far on the original thread and is copied on
+// every later update; the addition shows up in the ticket history and audit log.
+function canManageParticipants(user, ticket) {
+  return isITUser(user) || ticket.requester_id === user.id;
+}
+
+router.get('/:id/participants', (req, res) => {
+  const ticket = getTicket(req.params.id);
+  if (!ticket) return res.status(404).json({ error: 'Ticket not found' });
+  if (!canSeeTicket(req.user, ticket)) return res.status(403).json({ error: 'Not permitted' });
+  res.json({
+    caller: ticket.caller_email || ticket.requester_email,
+    cc: participants.listParticipants(ticket),
+    can_manage: canManageParticipants(req.user, ticket),
+    emails_thread: emailSync.hasEmailThread(ticket),
+  });
+});
+
+router.post('/:id/participants', (req, res) => {
+  const ticket = getTicket(req.params.id);
+  if (!ticket) return res.status(404).json({ error: 'Ticket not found' });
+  if (!canSeeTicket(req.user, ticket) || !canManageParticipants(req.user, ticket)) {
+    return res.status(403).json({ error: 'Not permitted' });
+  }
+  if (ticket.status === 'CLOSED') return res.status(400).json({ error: 'This ticket is closed' });
+  const input = req.body?.emails ?? req.body?.email ?? '';
+  if (!String(Array.isArray(input) ? input.join(',') : input).trim()) {
+    return res.status(400).json({ error: 'Enter at least one email address' });
+  }
+  let result;
+  try {
+    result = participants.addParticipants(ticket.id, input, {
+      actorId: req.user.id, actorName: req.user.full_name, via: 'portal', startThread: true,
+    });
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
+  }
+  if (!result.added.length) {
+    const reason = result.invalid.length
+      ? `Not a valid email address: ${result.invalid.join(', ')}`
+      : `Already on this ticket: ${result.skipped.map((s) => s.address).join(', ')}`;
+    return res.status(400).json({ error: reason, skipped: result.skipped });
+  }
+  const updated = getTicket(ticket.id);
+  res.status(201).json({
+    added: result.added,
+    skipped: result.skipped,
+    emailed: !!result.mail,
+    cc: participants.listParticipants(updated),
+    ticket: updated,
+  });
+});
+
+router.delete('/:id/participants/:email', (req, res) => {
+  const ticket = getTicket(req.params.id);
+  if (!ticket) return res.status(404).json({ error: 'Ticket not found' });
+  if (!canSeeTicket(req.user, ticket) || !canManageParticipants(req.user, ticket)) {
+    return res.status(403).json({ error: 'Not permitted' });
+  }
+  const result = participants.removeParticipants(ticket.id, req.params.email, {
+    actorId: req.user.id, actorName: req.user.full_name,
+  });
+  if (!result.removed.length) return res.status(404).json({ error: 'That address is not on the CC list' });
+  const updated = getTicket(ticket.id);
+  res.json({ removed: result.removed, cc: participants.listParticipants(updated), ticket: updated });
 });
 
 // ---------- Attachments ----------

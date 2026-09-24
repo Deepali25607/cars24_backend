@@ -36,15 +36,84 @@ router.get('/status', (_req, res) => {
   const last24 = db.prepare(`SELECT direction, processing_status, COUNT(*) AS n FROM email_message_log
     WHERE created_at >= datetime('now', '-1 day') GROUP BY direction, processing_status`).all();
   const jobs = db.prepare('SELECT status, COUNT(*) AS n FROM email_jobs GROUP BY status').all();
+  const cfg = getConfig();
   res.json({
-    enabled: !!getConfig().enabled,
+    enabled: !!cfg.enabled,
     listener: listenerStatus(),
     mailbox_configured: mailPollerEnabled(),
     smtp_configured: !!process.env.SMTP_HOST,
     metrics: elog.snapshot(),
     last_24h: last24,
     jobs,
+    // Production checklist: which settings are present (values never exposed).
+    env: {
+      NODE_ENV: process.env.NODE_ENV || 'development',
+      SMTP_HOST: !!process.env.SMTP_HOST, SMTP_PORT: process.env.SMTP_PORT || '587 (default)',
+      SMTP_SECURE: process.env.SMTP_SECURE || 'false (default)', SMTP_USER: !!process.env.SMTP_USER,
+      SMTP_PASS: !!process.env.SMTP_PASS, SMTP_FROM: process.env.SMTP_FROM || '(unset → itsm@company.local)',
+      MAIL_IN_HOST: process.env.MAIL_IN_HOST || null, MAIL_IN_PORT: process.env.MAIL_IN_PORT || '993 (default)',
+      MAIL_IN_SECURE: process.env.MAIL_IN_SECURE || 'true (default)', MAIL_IN_USER: process.env.MAIL_IN_USER || null,
+      MAIL_IN_PASS: !!process.env.MAIL_IN_PASS, MAIL_IN_OAUTH_TOKEN: !!process.env.MAIL_IN_OAUTH_TOKEN,
+      PORTAL_URL: cfg.portalUrl, mailbox_address: cfg.mailboxAddress, allowed_domains: cfg.allowedDomains,
+    },
   });
+});
+
+// ---------- Production diagnostics ----------
+// Send one test email through the configured SMTP transport and report the
+// transport's own error message (the same failure the job queue would retry).
+router.post('/test/smtp', async (req, res) => {
+  const to = String((req.body || {}).to || req.user.email).trim();
+  if (!/@/.test(to)) return res.status(400).json({ error: 'A valid recipient address is required' });
+  if (!process.env.SMTP_HOST) {
+    return res.status(400).json({ ok: false, error: 'SMTP_HOST is not set on the server — outbound mail is only logged to the console.' });
+  }
+  const { sendEmail } = require('../services');
+  const started = Date.now();
+  try {
+    const r = await sendEmail(to, `[ITSM] SMTP test ${new Date().toISOString()}`,
+      'This is a test message from the ITSM email channel. If you can read this, outbound SMTP works.',
+      { html: '<p>This is a test message from the ITSM email channel. If you can read this, outbound SMTP works.</p>', throwOnError: true });
+    audit(req.user.id, 'EMAIL_SMTP_TEST', 'email_channel_config', 1, to, req);
+    res.json({ ok: true, to, message_id: r.messageId, ms: Date.now() - started, from: process.env.SMTP_FROM || null });
+  } catch (err) {
+    res.json({ ok: false, to, error: err.message, code: err.code || err.responseCode || null, ms: Date.now() - started });
+  }
+});
+
+// Connect to the mailbox with the MAIL_IN_* credentials, open INBOX and
+// report counts — or the exact IMAP error.
+router.post('/test/imap', async (req, res) => {
+  const missing = ['MAIL_IN_HOST', 'MAIL_IN_USER'].filter((k) => !process.env[k]);
+  if (!process.env.MAIL_IN_PASS && !process.env.MAIL_IN_OAUTH_TOKEN) missing.push('MAIL_IN_PASS (or MAIL_IN_OAUTH_TOKEN)');
+  if (missing.length) return res.status(400).json({ ok: false, error: `Missing server settings: ${missing.join(', ')}` });
+  const { ImapFlow } = require('imapflow');
+  const started = Date.now();
+  const client = new ImapFlow({
+    host: process.env.MAIL_IN_HOST,
+    port: Number(process.env.MAIL_IN_PORT || 993),
+    secure: process.env.MAIL_IN_SECURE !== 'false',
+    auth: process.env.MAIL_IN_OAUTH_TOKEN
+      ? { user: process.env.MAIL_IN_USER, accessToken: process.env.MAIL_IN_OAUTH_TOKEN }
+      : { user: process.env.MAIL_IN_USER, pass: process.env.MAIL_IN_PASS },
+    logger: false, emitLogs: false, connectionTimeout: 20000, greetingTimeout: 20000,
+  });
+  try {
+    await client.connect();
+    const box = await client.mailboxOpen(process.env.MAIL_IN_FOLDER || 'INBOX');
+    const unseen = await client.search({ seen: false }, { uid: true });
+    const folders = (await client.list()).map((m) => m.path);
+    await client.logout();
+    audit(req.user.id, 'EMAIL_IMAP_TEST', 'email_channel_config', 1, process.env.MAIL_IN_USER, req);
+    res.json({
+      ok: true, host: process.env.MAIL_IN_HOST, user: process.env.MAIL_IN_USER, folder: box.path,
+      messages: box.exists, unseen: (unseen || []).length, folders: folders.slice(0, 30), ms: Date.now() - started,
+    });
+  } catch (err) {
+    try { await client.logout(); } catch { /* ignore */ }
+    res.json({ ok: false, host: process.env.MAIL_IN_HOST, user: process.env.MAIL_IN_USER, error: err.message,
+      code: err.code || err.responseText || null, ms: Date.now() - started });
+  }
 });
 
 // ---------- Configuration ----------
