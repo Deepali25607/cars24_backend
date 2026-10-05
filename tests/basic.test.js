@@ -223,6 +223,68 @@ test('RBAC-5 team lead can reassign to another agent', async () => {
   });
 });
 
+// ------- Cross-team ticket privacy (fix for PDF test findings, 30 Sep 2026) -------
+// The PDF reported any support agent could read any other team's tickets. These
+// tests assert the fix: a ticket owned by one team is invisible to agents on
+// other teams -- 403 on detail, and absent from every list incl. the pickup queue.
+
+test('XTEAM-1 a ticket owned by another team is hidden from unrelated agents', async () => {
+  const secGroup = meta.groups.find((g) => g.name === 'Security Team');
+  const hw = meta.categories.find((c) => c.name === 'Hardware');
+  // Employee raises a ticket; admin routes it to the Security Team (no agent yet).
+  const r = await api('/api/tickets', {
+    method: 'POST', token: tokens.employee,
+    body: {
+      title: 'Suspected phishing', description: 'User clicked a suspicious link.',
+      category_id: hw.id, priority_id: 1,
+    },
+  });
+  assert.equal(r.status, 201);
+  const secTicketId = r.data.id;
+  const routed = await api(`/api/tickets/${secTicketId}/assign`, {
+    method: 'POST', token: tokens.admin, body: { group_id: secGroup.id },
+  });
+  assert.equal(routed.status, 200);
+  assert.equal(routed.data.support_group_id, secGroup.id, 'ticket now owned by Security Team');
+
+  // Desktop Support agent and Network agent are on other teams -> 403 on detail.
+  for (const role of ['agent', 'agent2']) {
+    const d = await api(`/api/tickets/${secTicketId}`, { token: tokens[role] });
+    assert.equal(d.status, 403, `${role} must not open another team's ticket`);
+  }
+  // Admin can always see it.
+  const asAdmin = await api(`/api/tickets/${secTicketId}`, { token: tokens.admin });
+  assert.equal(asAdmin.status, 200);
+});
+
+test('XTEAM-2 another team\'s unassigned ticket never appears in an agent\'s lists or pickup queue', async () => {
+  const secGroup = meta.groups.find((g) => g.name === 'Security Team');
+  const hw = meta.categories.find((c) => c.name === 'Hardware');
+  const r = await api('/api/tickets', {
+    method: 'POST', token: tokens.employee,
+    body: {
+      title: 'Ransomware alert', description: 'Files encrypted on a laptop.',
+      category_id: hw.id, priority_id: 1,
+    },
+  });
+  const secId = r.data.id;
+  // Route to Security Team but leave it unassigned (no agent) -- the exact state
+  // the PDF's leak exposed via the team-less "unassigned" queue.
+  await api(`/api/tickets/${secId}/assign`, {
+    method: 'POST', token: tokens.admin, body: { group_id: secGroup.id },
+  });
+
+  for (const scope of ['', '?scope=team', '?scope=unassigned']) {
+    const list = await api(`/api/tickets${scope}`, { token: tokens.agent });
+    assert.equal(list.status, 200);
+    assert.ok(!list.data.some((t) => t.id === secId),
+      `scope "${scope || 'default'}" leaked another team's ticket to a Desktop agent`);
+  }
+  // Sanity: admin (no team scoping) still sees it in the unassigned queue.
+  const adminQueue = await api('/api/tickets?scope=unassigned', { token: tokens.admin });
+  assert.ok(adminQueue.data.some((t) => t.id === secId), 'admin should still see it in the queue');
+});
+
 // ---------------- Lifecycle ----------------
 
 test('LIFE-1 invalid transitions are rejected', async () => {

@@ -935,3 +935,43 @@ test('EM-23 portal: several addresses go on copy in one step, get the trail, sho
   const forbidden = await api(`/api/tickets/${id}/participants`, { method: 'POST', token: rohit, body: { emails: 'x@cars24.com' } });
   assert.equal(forbidden.status, 403);
 });
+
+// ---------- Cross-team intake privacy with a triage group (PDF fix, 30 Sep 2026) ----------
+// With a Service Desk Triage group configured, an untriaged (no-group) ticket is
+// first-line intake: only the triage group and Admins may see it, NOT every agent.
+// This closes the PDF finding where an unsorted sensitive case was readable by all.
+test('EM-XTEAM untriaged intake is limited to the triage group + admin, not every agent', async () => {
+  const meta = (await api('/api/meta', { token: tokens.admin })).data;
+  const gen = meta.categories.find((c) => c.name === 'General');
+  const triage = meta.groups.find((g) => g.name === 'Service Desk Triage');
+  assert.ok(gen && triage, 'General category and triage group are seeded');
+
+  // A portal ticket under a category with no routing rule stays untriaged (no group).
+  const created = await api('/api/tickets', {
+    method: 'POST', token: tokens.employee,
+    body: { title: 'Unsure who handles this', description: 'Possible data leak.', category_id: gen.id, priority_id: 2 },
+  });
+  assert.equal(created.status, 201);
+  assert.equal(created.data.support_group_id, null, 'ticket is untriaged');
+  const intakeId = created.data.id;
+
+  // Desktop Support agent (not triage) must NOT see untriaged intake -- detail or lists.
+  assert.equal((await api(`/api/tickets/${intakeId}`, { token: tokens.agent })).status, 403);
+  for (const scope of ['', '?scope=team', '?scope=unassigned']) {
+    const list = await api(`/api/tickets${scope}`, { token: tokens.agent });
+    assert.ok(!list.data.some((t) => t.id === intakeId),
+      `intake leaked to a non-triage agent in scope "${scope || 'default'}"`);
+  }
+
+  // A triage-group agent and the admin CAN see and pick up intake.
+  const mk = await api('/api/admin/users', {
+    method: 'POST', token: tokens.admin,
+    body: { email: 'triage@itsm.local', full_name: 'Tara Triage', role: 'AGENT', password: 'Passw0rd!', support_group_id: triage.id },
+  });
+  assert.equal(mk.status, 201);
+  const triToken = await login('triage@itsm.local');
+  assert.equal((await api(`/api/tickets/${intakeId}`, { token: triToken })).status, 200);
+  const triQueue = await api('/api/tickets?scope=unassigned', { token: triToken });
+  assert.ok(triQueue.data.some((t) => t.id === intakeId), 'triage agent sees intake in pickup queue');
+  assert.equal((await api(`/api/tickets/${intakeId}`, { token: tokens.admin })).status, 200);
+});

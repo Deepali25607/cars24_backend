@@ -75,7 +75,7 @@ function canSeeTicket(user, ticket) {
   if (user.email && participants.listParticipants(ticket).includes(user.email.toLowerCase())) return true;
   if (user.role === 'AGENT' || user.role === 'TEAM_LEAD') {
     if (ticket.assigned_agent_id === user.id) return true;
-    if (!ticket.support_group_id) return true; // untriaged queue is visible to IT
+    if (!ticket.support_group_id) return canSeeIntake(user); // untriaged intake: triage/admin only
     return ticket.support_group_id === user.support_group_id;
   }
   return false;
@@ -83,6 +83,30 @@ function canSeeTicket(user, ticket) {
 
 function isITUser(user) {
   return IT_ROLES.includes(user.role);
+}
+
+// Untriaged tickets (no support group yet) form the first-line intake queue.
+// They must NOT be readable by every IT user — only Admins and the Service Desk
+// Triage group handle intake. This stops an unsorted sensitive case (e.g. an
+// unclassified security/phishing report that no routing rule matched) from being
+// visible to agents on unrelated teams. Routed tickets stay gated by group.
+let _triageGroupId;
+function triageGroupId() {
+  if (!_triageGroupId) {
+    const row = db.prepare("SELECT id FROM support_groups WHERE name = 'Service Desk Triage'").get();
+    _triageGroupId = row ? row.id : null; // re-query while absent (group is seeded lazily)
+  }
+  return _triageGroupId;
+}
+function canSeeIntake(user) {
+  if (user.role === 'ADMIN') return true;
+  const tg = triageGroupId();
+  // No triage group configured (pure Basic): IT shares the intake/pickup queue,
+  // which is the Basic manual-assignment workflow. Once a triage group exists
+  // (Standard/email deployments), intake narrows to that group + Admins so an
+  // unsorted sensitive case is no longer visible to every agent.
+  if (tg == null) return isITUser(user);
+  return user.support_group_id != null && user.support_group_id === tg;
 }
 
 const TRANSITIONS = {
@@ -185,14 +209,26 @@ router.get('/', (req, res) => {
   } else if (scope === 'unassigned') {
     where.push('t.assigned_agent_id IS NULL');
     where.push("t.status IN ('NEW','REOPENED')");
+    if (req.user.role !== 'ADMIN') {
+      // unassigned work is still team-scoped: an agent's pickup queue is their
+      // own group's tickets, plus untriaged intake only if they staff triage.
+      const vis = ['t.support_group_id = @gid'];
+      if (canSeeIntake(req.user)) vis.push('t.support_group_id IS NULL');
+      where.push(`(${vis.join(' OR ')})`);
+      params.gid = req.user.support_group_id;
+    }
   } else if (scope === 'team') {
     if (req.user.role !== 'ADMIN') {
-      where.push('(t.support_group_id = @gid OR t.support_group_id IS NULL)');
+      const vis = ['t.support_group_id = @gid'];
+      if (canSeeIntake(req.user)) vis.push('t.support_group_id IS NULL');
+      where.push(`(${vis.join(' OR ')})`);
       params.gid = req.user.support_group_id;
     }
   } else if (req.user.role !== 'ADMIN') {
-    // default IT scope: my work + my team's queue + unassigned
-    where.push('(t.assigned_agent_id = @uid OR t.support_group_id = @gid OR t.support_group_id IS NULL)');
+    // default IT scope: my work + my team's queue (+ untriaged intake for triage)
+    const vis = ['t.assigned_agent_id = @uid', 't.support_group_id = @gid'];
+    if (canSeeIntake(req.user)) vis.push('t.support_group_id IS NULL');
+    where.push(`(${vis.join(' OR ')})`);
     params.gid = req.user.support_group_id;
   }
   params.uid = req.user.id;
