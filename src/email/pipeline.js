@@ -136,28 +136,43 @@ async function saveAttachments(ticketId, uploaderId, atts) {
       rejected.push({ filename: a.filename, reason: `antivirus: ${scan.detail || 'rejected'}` });
       continue;
     }
+    // Store a neutralised MIME type: anything off the shared allowlist becomes
+    // application/octet-stream so the portal can never render it inline as script.
+    const { safeMime } = require('../attachmentPolicy');
     db.prepare(`INSERT INTO ticket_attachments (ticket_id, uploader_id, original_name, stored_name, mime_type, size_bytes)
-      VALUES (?,?,?,?,?,?)`).run(ticketId, uploaderId, String(a.filename).slice(0, 255), stored, a.contentType, a.size || a.content.length);
+      VALUES (?,?,?,?,?,?)`).run(ticketId, uploaderId, String(a.filename).slice(0, 255), stored, safeMime(a.contentType), a.size || a.content.length);
     saved.push(a.filename);
   }
   return { saved, rejected };
 }
 
-function senderIsParticipant(ticket, address, user, config) {
-  if (!address) return false;
-  if (ticket.caller_email && ticket.caller_email.toLowerCase() === address) return true;
-  if (user && ticket.requester_id === user.id) return true;
-  if (user && ['AGENT', 'TEAM_LEAD', 'ADMIN'].includes(user.role)) return true;
-  // Written from the shared support mailbox: that is the service desk itself,
-  // not an outside party writing in.
-  if (config && config.systemAddresses.has(address)) return true;
-  return participants.listParticipants(ticket).includes(address);
+// The sender's relationship to the ticket (FR4/FR9).
+//   mayReply — allowed to update/thread the incident at all: the service desk,
+//     the caller, the requester, the assigned agent, or an address already on
+//     the CC/participant list. A random allowed-domain sender who was never part
+//     of the ticket may NOT inject a reply by guessing the INC number.
+//   primary  — the service desk / caller / requester / assigned agent (i.e. not
+//     an outside copied participant); used only to set the external flag.
+function senderRelation(ticket, address, user, config) {
+  const addr = String(address || '').toLowerCase();
+  const isSystem = !!(config && config.systemAddresses.has(addr));
+  const isCaller = !!(ticket.caller_email && ticket.caller_email.toLowerCase() === addr);
+  const isRequester = !!(user && ticket.requester_id === user.id);
+  const isAssignedAgent = !!(user && ticket.assigned_agent_id === user.id);
+  const onCcList = participants.listParticipants(ticket).includes(addr);
+  const primary = isSystem || isCaller || isRequester || isAssignedAgent;
+  return { mayReply: primary || onCcList, primary };
 }
 
+// A reply reopens its own incident when the incident is RESOLVED or CLOSED and
+// the reply arrives within the configured window (measured from when it was
+// resolved/closed). Older-than-window replies open a new linked incident.
 function withinReopenWindow(ticket, days) {
-  if (ticket.status !== 'RESOLVED' || !ticket.resolved_at) return false;
-  const resolved = new Date(ticket.resolved_at.replace(' ', 'T') + 'Z').getTime();
-  return Date.now() - resolved <= days * 86400000;
+  if (ticket.status !== 'RESOLVED' && ticket.status !== 'CLOSED') return false;
+  const stamp = ticket.closed_at || ticket.resolved_at || ticket.updated_at;
+  if (!stamp) return false;
+  const when = new Date(String(stamp).replace(' ', 'T') + 'Z').getTime();
+  return Date.now() - when <= days * 86400000;
 }
 
 // ---------------------------------------------------------------------------
@@ -217,7 +232,14 @@ async function processInboundEmail(input, opts = {}) {
       const bounce = parser.isBounce(msg);
       if (bounce.bounce) {
         const related = matchThread(msg);
-        if (related.ticket) {
+        // FR9: a bounce only touches a ticket when it genuinely correlates — it
+        // was matched by In-Reply-To/References to a message we sent (hard to
+        // forge), or it comes from an allowed domain. A spoofed "bounce" that
+        // merely carries an INC token in the subject is dropped without changing
+        // any ticket.
+        const bounceDomain = (from.slice(from.lastIndexOf('@') + 1) || '').toLowerCase();
+        const bounceTrusted = related.via === 'HEADER' || config.allowedDomains.includes(bounceDomain);
+        if (related.ticket && bounceTrusted) {
           const sys = db.prepare("SELECT id FROM users WHERE role = 'ADMIN' AND active = 1 ORDER BY id LIMIT 1").get();
           if (sys) {
             db.prepare("INSERT INTO ticket_comments (ticket_id, author_id, body, is_internal, source, email_log_id) VALUES (?,?,?,1,'EMAIL',?)")
@@ -243,10 +265,19 @@ async function processInboundEmail(input, opts = {}) {
     }
 
     // ---- SPF/DKIM/DMARC (FR9) ----
-    if (!force && config.auth_check_mode === 'QUARANTINE_FAIL') {
+    // QUARANTINE_FAIL: hold mail whose SPF/DKIM/DMARC explicitly fails or softfails.
+    // REQUIRE_PASS (production hardening): hold any mail that does NOT carry a
+    //   DMARC/DKIM pass from our own mail server's authserv-id — i.e. trust the
+    //   From identity only when it is cryptographically verified. Enable this once
+    //   the mailbox provider is stamping Authentication-Results.
+    if (!force && config.auth_check_mode !== 'OFF') {
       const auth = parser.parseAuthResults(msg.headers);
       if (auth.failed.length) {
         return finish('QUARANTINED', `Email authentication failed: ${auth.failed.map((k) => `${k}=fail`).join(', ')}`, {}, 202, { quarantined: true });
+      }
+      if (config.auth_check_mode === 'REQUIRE_PASS'
+          && !parser.senderAuthVerified(msg, process.env.MAIL_AUTHSERV_ID || parser.domainOf(config.mailboxAddress || ''))) {
+        return finish('QUARANTINED', 'Sender identity is not verified (no DMARC/DKIM pass from a trusted mail server)', {}, 202, { quarantined: true });
       }
     }
 
@@ -273,11 +304,24 @@ async function processInboundEmail(input, opts = {}) {
     // =============== UPDATE an existing incident (FR6) ===============
     if (match.kind === 'UPDATE') {
       let ticket = match.ticket;
-      const closedOrStale = ticket.status === 'CLOSED'
-        || (ticket.status === 'RESOLVED' && !withinReopenWindow(ticket, config.reopen_window_days));
+      // FR4/FR9: only someone already connected to the incident may update it by
+      // email. A reply from an address that is not the caller, requester, assigned
+      // agent, the service desk, or an existing CC participant is held for review
+      // — this stops any allowed-domain sender commenting on / reopening a ticket
+      // by guessing its INC number.
+      const rel = senderRelation(ticket, from, user, config);
+      if (!force && !rel.mayReply) {
+        return finish('QUARANTINED', `Reply to ${ticket.ticket_number} from a non-participant (${from})`,
+          {}, 202, { quarantined: true, ticket_number: ticket.ticket_number });
+      }
+      // A reply to a RESOLVED or CLOSED incident reopens that same incident when
+      // it is still within the reopen window; only a genuinely stale incident
+      // (beyond the window) spawns a new linked incident.
+      const inactive = ticket.status === 'CLOSED' || ticket.status === 'RESOLVED';
+      const closedOrStale = inactive && !withinReopenWindow(ticket, config.reopen_window_days);
       if (!closedOrStale) {
         let reopened = false;
-        if (ticket.status === 'RESOLVED') {
+        if (ticket.status === 'RESOLVED' || ticket.status === 'CLOSED') {
           db.prepare("UPDATE tickets SET status = 'REOPENED', reopen_count = reopen_count + 1, updated_at = datetime('now') WHERE id = ?").run(ticket.id);
           ticket = db.prepare('SELECT * FROM tickets WHERE id = ?').get(ticket.id);
           reopenSla(ticket);
@@ -285,7 +329,7 @@ async function processInboundEmail(input, opts = {}) {
           runWorkflows('ticket.status.REOPENED', ticket);
           reopened = true;
         }
-        const external = !senderIsParticipant(ticket, from, user, config) ? 1 : 0;
+        const external = rel.primary ? 0 : 1;
         // First email on a portal-created ticket starts its email thread: from
         // now on agent updates are mailed back on it (see outbound.shouldSync).
         if (!ticket.thread_subject) {

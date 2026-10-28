@@ -333,8 +333,16 @@ function buildReport(user, query) {
 // ---------- renderers ----------
 const filtersLine = (rep) => `Team: ${rep.filters.team} · Priority: ${rep.filters.priority} · Category: ${rep.filters.category} · Status: ${rep.filters.status}`;
 
+// Neutralise spreadsheet formula injection: a cell whose text starts with
+// = + - @ (or a leading tab/CR) can execute when opened in Excel/Sheets. Prefix
+// a single quote so it is treated as literal text.
+function neutralizeCell(v) {
+  const s = String(v ?? '');
+  return /^[=+\-@\t\r]/.test(s) ? `'${s}` : s;
+}
+
 function toCsv(rep) {
-  const esc = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
+  const esc = (v) => `"${neutralizeCell(v).replace(/"/g, '""')}"`;
   const lines = [
     [rep.title], [`Period: ${rep.period.label}`], [filtersLine(rep)], [`Generated: ${rep.generated_at} by ${rep.generated_by}`], [],
     rep.columns.map((c) => c.label), ...rep.rows.map((r) => rep.columns.map((c) => r[c.key])),
@@ -365,7 +373,10 @@ async function toXlsx(rep) {
     });
     rows.forEach((r, ri) => {
       const row = ws.getRow(startRow + 1 + ri);
-      row.values = columns.map((c) => r[c.key] ?? '');
+      row.values = columns.map((c) => {
+        const v = r[c.key] ?? '';
+        return typeof v === 'string' ? neutralizeCell(v) : v;
+      });
       columns.forEach((c, i) => {
         const cell = row.getCell(i + 1);
         cell.alignment = { horizontal: c.align === 'right' ? 'right' : 'left', vertical: 'top', wrapText: !!c.wide };

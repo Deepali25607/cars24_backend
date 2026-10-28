@@ -1,11 +1,17 @@
 const express = require('express');
 const { db } = require('../db');
 const { authenticate, requireRole, IT_ROLES } = require('../auth');
+const { canSeeTicket } = require('../ticketAccess');
 const { aiStatus, classify, recommend, summarize, chatReply, recommendAssignment } = require('../ai');
 const { breachProbability, recommendations } = require('../predict');
 
 const router = express.Router();
 router.use(authenticate);
+
+// Fetch the access-control columns for a ticket by id (null if missing).
+const accessRow = (id) => db.prepare(
+  'SELECT id, requester_id, assigned_agent_id, support_group_id, cc_list FROM tickets WHERE id = ?'
+).get(id);
 
 router.get('/status', (_req, res) => res.json(aiStatus()));
 
@@ -22,8 +28,9 @@ router.post('/recommend', requireRole(...IT_ROLES), (req, res) => {
   const { text, ticket_id } = req.body || {};
   let query = text;
   if (ticket_id) {
-    const t = db.prepare('SELECT title, description FROM tickets WHERE id = ?').get(ticket_id);
+    const t = db.prepare('SELECT title, description, requester_id, assigned_agent_id, support_group_id, cc_list FROM tickets WHERE id = ?').get(ticket_id);
     if (!t) return res.status(404).json({ error: 'Ticket not found' });
+    if (!canSeeTicket(req.user, t)) return res.status(403).json({ error: 'Not permitted' });
     query = `${t.title} ${t.description}`;
   }
   if (!query) return res.status(400).json({ error: 'Provide text or a ticket to analyse' });
@@ -32,11 +39,9 @@ router.post('/recommend', requireRole(...IT_ROLES), (req, res) => {
 
 // BRD 8.9: ticket summary (requester or IT).
 router.get('/summary/:ticketId', async (req, res) => {
-  const t = db.prepare('SELECT requester_id FROM tickets WHERE id = ?').get(req.params.ticketId);
+  const t = accessRow(req.params.ticketId);
   if (!t) return res.status(404).json({ error: 'Ticket not found' });
-  if (t.requester_id !== req.user.id && !IT_ROLES.includes(req.user.role)) {
-    return res.status(403).json({ error: 'Not permitted' });
-  }
+  if (!canSeeTicket(req.user, t)) return res.status(403).json({ error: 'Not permitted' });
   res.json(await summarize(req.params.ticketId));
 });
 
@@ -54,6 +59,7 @@ router.post('/chat', (req, res) => {
 router.get('/assignment/:ticketId', requireRole(...IT_ROLES), (req, res) => {
   const ticket = db.prepare('SELECT * FROM tickets WHERE id = ?').get(req.params.ticketId);
   if (!ticket) return res.status(404).json({ error: 'Ticket not found' });
+  if (!canSeeTicket(req.user, ticket)) return res.status(403).json({ error: 'Not permitted' });
   res.json({ recommendations: recommendAssignment(ticket) });
 });
 
@@ -61,6 +67,7 @@ router.get('/assignment/:ticketId', requireRole(...IT_ROLES), (req, res) => {
 router.get('/sla-prediction/:ticketId', requireRole(...IT_ROLES), (req, res) => {
   const ticket = db.prepare('SELECT * FROM tickets WHERE id = ?').get(req.params.ticketId);
   if (!ticket) return res.status(404).json({ error: 'Ticket not found' });
+  if (!canSeeTicket(req.user, ticket)) return res.status(403).json({ error: 'Not permitted' });
   const sla = db.prepare('SELECT * FROM ticket_sla WHERE ticket_id = ?').get(ticket.id);
   const probability = breachProbability(ticket, sla);
   res.json({

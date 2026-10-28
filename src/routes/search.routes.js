@@ -1,6 +1,7 @@
 const express = require('express');
 const { db } = require('../db');
 const { authenticate, IT_ROLES } = require('../auth');
+const { canSeeTicket } = require('../ticketAccess');
 
 const router = express.Router();
 router.use(authenticate);
@@ -15,23 +16,22 @@ router.get('/', (req, res) => {
   const it = isIT(req.user);
 
   let tickets;
-  if (it && req.user.role === 'ADMIN') {
-    tickets = db.prepare(`SELECT t.id, t.ticket_number, t.title, t.status, p.code AS priority_code
-      FROM tickets t JOIN priorities p ON p.id = t.priority_id
-      WHERE (t.title LIKE @q OR t.description LIKE @q OR t.ticket_number LIKE @q)
-      ORDER BY t.updated_at DESC LIMIT 20`).all({ q: like });
-  } else if (it) {
-    tickets = db.prepare(`SELECT t.id, t.ticket_number, t.title, t.status, p.code AS priority_code
-      FROM tickets t JOIN priorities p ON p.id = t.priority_id
-      WHERE (t.title LIKE @q OR t.description LIKE @q OR t.ticket_number LIKE @q)
-        AND (t.assigned_agent_id = @uid OR t.support_group_id = @gid OR t.support_group_id IS NULL)
-      ORDER BY t.updated_at DESC LIMIT 20`)
-      .all({ q: like, uid: req.user.id, gid: req.user.support_group_id ?? -1 });
-  } else {
+  if (!it) {
     tickets = db.prepare(`SELECT t.id, t.ticket_number, t.title, t.status, p.code AS priority_code
       FROM tickets t JOIN priorities p ON p.id = t.priority_id
       WHERE t.requester_id = @uid AND (t.title LIKE @q OR t.description LIKE @q OR t.ticket_number LIKE @q)
       ORDER BY t.updated_at DESC LIMIT 20`).all({ q: like, uid: req.user.id });
+  } else {
+    // Fetch candidates with the access-control columns, then apply the same
+    // canSeeTicket rule used everywhere (group/triage isolation) and cap at 20,
+    // so search cannot surface tickets the user may not open.
+    const candidates = db.prepare(`SELECT t.id, t.ticket_number, t.title, t.status, p.code AS priority_code,
+        t.requester_id, t.assigned_agent_id, t.support_group_id, t.cc_list
+      FROM tickets t JOIN priorities p ON p.id = t.priority_id
+      WHERE (t.title LIKE @q OR t.description LIKE @q OR t.ticket_number LIKE @q)
+      ORDER BY t.updated_at DESC LIMIT 100`).all({ q: like });
+    tickets = candidates.filter((t) => canSeeTicket(req.user, t)).slice(0, 20)
+      .map(({ requester_id, assigned_agent_id, support_group_id, cc_list, ...pub }) => pub);
   }
 
   const kb = db.prepare(`SELECT id, article_number, title, status FROM kb_articles

@@ -2,3 +2,14 @@ node_modules/
 data/
 uploads/
 .env
+.env.*
+!.env.example
+
+# Database files and backups must never be committed (they contain password
+# hashes, API-token hashes and raw email logs).
+*.db
+*.db-wal
+*.db-shm
+backups/
+tests/*.db
+tests/test-backups/

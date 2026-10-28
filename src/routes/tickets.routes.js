@@ -5,6 +5,8 @@ const fs = require('fs');
 const crypto = require('crypto');
 const { db, nextTicketNumber } = require('../db');
 const { authenticate, requireRole, IT_ROLES } = require('../auth');
+const { canSeeTicket, canSeeIntake, triageGroupId, isITUser } = require('../ticketAccess');
+const { ALLOWED_MIME } = require('../attachmentPolicy');
 const { audit, ticketHistory, notifyUser, notifyTicketParties } = require('../services');
 const { applySla, recomputeSla, pauseSla, resumeSla, markFirstResponse,
   completeSla, reopenSla, getTicketSla } = require('../sla');
@@ -22,10 +24,6 @@ router.use(authenticate);
 const UPLOAD_DIR = path.join(__dirname, '..', '..', 'uploads');
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
-const ALLOWED_MIME = new Set([
-  'image/png', 'image/jpeg', 'image/gif', 'image/webp',
-  'application/pdf', 'text/plain', 'text/csv', 'application/zip',
-]);
 const MAX_FILE_MB = Number(process.env.MAX_FILE_MB || 10);
 
 const upload = multer({
@@ -65,48 +63,6 @@ const TICKET_SELECT = `
 
 function getTicket(id) {
   return db.prepare(`${TICKET_SELECT} WHERE t.id = ?`).get(id);
-}
-
-function canSeeTicket(user, ticket) {
-  if (user.role === 'ADMIN') return true;
-  if (ticket.requester_id === user.id) return true;
-  // On the incident's CC list: they already receive the whole email trail, so
-  // they may follow the same conversation in the portal.
-  if (user.email && participants.listParticipants(ticket).includes(user.email.toLowerCase())) return true;
-  if (user.role === 'AGENT' || user.role === 'TEAM_LEAD') {
-    if (ticket.assigned_agent_id === user.id) return true;
-    if (!ticket.support_group_id) return canSeeIntake(user); // untriaged intake: triage/admin only
-    return ticket.support_group_id === user.support_group_id;
-  }
-  return false;
-}
-
-function isITUser(user) {
-  return IT_ROLES.includes(user.role);
-}
-
-// Untriaged tickets (no support group yet) form the first-line intake queue.
-// They must NOT be readable by every IT user — only Admins and the Service Desk
-// Triage group handle intake. This stops an unsorted sensitive case (e.g. an
-// unclassified security/phishing report that no routing rule matched) from being
-// visible to agents on unrelated teams. Routed tickets stay gated by group.
-let _triageGroupId;
-function triageGroupId() {
-  if (!_triageGroupId) {
-    const row = db.prepare("SELECT id FROM support_groups WHERE name = 'Service Desk Triage'").get();
-    _triageGroupId = row ? row.id : null; // re-query while absent (group is seeded lazily)
-  }
-  return _triageGroupId;
-}
-function canSeeIntake(user) {
-  if (user.role === 'ADMIN') return true;
-  const tg = triageGroupId();
-  // No triage group configured (pure Basic): IT shares the intake/pickup queue,
-  // which is the Basic manual-assignment workflow. Once a triage group exists
-  // (Standard/email deployments), intake narrows to that group + Admins so an
-  // unsorted sensitive case is no longer visible to every agent.
-  if (tg == null) return isITUser(user);
-  return user.support_group_id != null && user.support_group_id === tg;
 }
 
 const TRANSITIONS = {
@@ -287,6 +243,9 @@ router.get('/:id', (req, res) => {
 router.post('/:id/assign', requireRole(...IT_ROLES), (req, res) => {
   const ticket = getTicket(req.params.id);
   if (!ticket) return res.status(404).json({ error: 'Ticket not found' });
+  // Agents may only act on tickets they can already see (stops an agent
+  // self-assigning another team's ticket to read it); Team Leads/Admins route.
+  if (!canSeeTicket(req.user, ticket)) return res.status(403).json({ error: 'Not permitted' });
   const { agent_id, group_id } = req.body || {};
 
   // Agents may take tickets themselves; leads/admins may assign to anyone.
@@ -325,6 +284,7 @@ router.post('/:id/assign', requireRole(...IT_ROLES), (req, res) => {
 router.patch('/:id', requireRole(...IT_ROLES), (req, res) => {
   const ticket = getTicket(req.params.id);
   if (!ticket) return res.status(404).json({ error: 'Ticket not found' });
+  if (!canSeeTicket(req.user, ticket)) return res.status(403).json({ error: 'Not permitted' });
   const { category_id, subcategory_id, priority_id, location_id } = req.body || {};
   const changes = [];
 
@@ -378,6 +338,8 @@ router.post('/:id/status', (req, res) => {
   const isRequester = ticket.requester_id === req.user.id;
   const it = isITUser(req.user);
   if (!it && !isRequester) return res.status(403).json({ error: 'Not permitted' });
+  // Group/triage isolation: an IT user may only act on tickets they can see.
+  if (!canSeeTicket(req.user, ticket)) return res.status(403).json({ error: 'Not permitted' });
 
   const allowed = TRANSITIONS[ticket.status] || [];
   if (!allowed.includes(target)) {
@@ -585,8 +547,13 @@ router.get('/:id/attachments/:attId', (req, res) => {
   const att = db.prepare('SELECT * FROM ticket_attachments WHERE id = ? AND ticket_id = ?')
     .get(req.params.attId, ticket.id);
   if (!att) return res.status(404).json({ error: 'Attachment not found' });
-  res.setHeader('Content-Type', att.mime_type);
-  res.setHeader('Content-Disposition', `inline; filename="${encodeURIComponent(att.original_name)}"`);
+  // Never render an attachment inline in the portal's origin (stored XSS via
+  // text/html or image/svg+xml). Force a download, neutralise the type, and
+  // stop the browser sniffing a safe type into an executable one.
+  const safeName = String(att.original_name || 'attachment').replace(/[\r\n"\\]/g, '_');
+  res.setHeader('Content-Type', require('../attachmentPolicy').safeMime(att.mime_type));
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Content-Disposition', `attachment; filename="${safeName}"; filename*=UTF-8''${encodeURIComponent(att.original_name || 'attachment')}`);
   res.sendFile(path.join(UPLOAD_DIR, att.stored_name));
 });
 

@@ -184,7 +184,10 @@ function sanitizeHtml(html) {
       img: ['src', 'alt', 'width', 'height'],
       '*': ['style'],
     },
-    allowedSchemes: ['http', 'https', 'mailto', 'cid', 'data'],
+    allowedSchemes: ['http', 'https', 'mailto', 'cid'], // no data: URLs
+    // Images may only reference inline (cid:) attachments — never a remote URL,
+    // so sanitised mail cannot phone home via tracking pixels.
+    allowedSchemesByTag: { img: ['cid'] },
     allowedStyles: { '*': { color: [/^.*$/], 'font-weight': [/^.*$/], 'text-decoration': [/^.*$/] } },
   });
 }
@@ -277,16 +280,31 @@ function isBounce(msg) {
 // Authentication-Results: "mx.example.com; spf=pass ...; dkim=fail ...; dmarc=pass ..."
 function parseAuthResults(headers) {
   const raw = (headers || {})['authentication-results'] || '';
-  const out = { present: !!raw, spf: null, dkim: null, dmarc: null, failed: [] };
+  const out = { present: !!raw, authservId: null, spf: null, dkim: null, dmarc: null, failed: [], verified: false };
   if (!raw) return out;
+  // The first token before ';' is the authserv-id (the verifying host). Only an
+  // authserv-id we trust (our own mail server) should be believed.
+  out.authservId = String(raw).split(';')[0].trim().toLowerCase();
   for (const key of ['spf', 'dkim', 'dmarc']) {
     const m = new RegExp(`\\b${key}=([a-z]+)`, 'i').exec(raw);
     if (m) {
       out[key] = m[1].toLowerCase();
-      if (out[key] === 'fail') out.failed.push(key);
+      // softfail / fail are not a pass; "none" means unverified, not trusted.
+      if (out[key] === 'fail' || out[key] === 'softfail') out.failed.push(key);
     }
   }
+  // Verified identity = a real DMARC pass, or a DKIM pass (aligned signature).
+  out.verified = out.dmarc === 'pass' || out.dkim === 'pass';
   return out;
+}
+
+// True only when the message carries an Authentication-Results header stamped by
+// our own mail server (authserv-id) AND shows a DMARC/DKIM pass.
+function senderAuthVerified(msg, authServId) {
+  const auth = parseAuthResults(msg.headers);
+  if (!auth.present || !auth.verified) return false;
+  if (authServId && auth.authservId && auth.authservId !== String(authServId).toLowerCase()) return false;
+  return true;
 }
 
 function domainOf(address) {
@@ -296,6 +314,6 @@ function domainOf(address) {
 
 module.exports = {
   parseRawEmail, normalizeInput, stripSubjectPrefixes, extractTokens, cleanSubject,
-  htmlToText, sanitizeHtml, stripQuotedReply, isAutoReply, isBounce, parseAuthResults,
+  htmlToText, sanitizeHtml, stripQuotedReply, isAutoReply, isBounce, parseAuthResults, senderAuthVerified,
   normalizeMessageId, domainOf, addrList,
 };

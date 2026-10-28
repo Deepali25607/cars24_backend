@@ -1,6 +1,7 @@
 const express = require('express');
 const { db } = require('../db');
 const { authenticate, requireRole, IT_ROLES } = require('../auth');
+const { canSeeTicket } = require('../ticketAccess');
 const { audit, ticketHistory, notifyUser, notifyTicketParties } = require('../services');
 const { runWorkflows } = require('../workflow');
 
@@ -47,9 +48,13 @@ router.get('/', requireRole(...IT_ROLES), (_req, res) => {
 });
 
 router.get('/:ticketId', requireRole(...IT_ROLES), (req, res) => {
-  const data = miData(req.params.ticketId);
-  if (!data) return res.status(404).json({ error: 'Ticket not found' });
-  res.json(data);
+  const ticket = getTicket(req.params.ticketId);
+  if (!ticket) return res.status(404).json({ error: 'Ticket not found' });
+  // Declared major incidents are org-wide IT coordination (bridge); any IT user
+  // may view them. For a non-major ticket, fall back to normal group visibility
+  // so this endpoint cannot be used to probe other teams' regular tickets.
+  if (!ticket.is_major && !canSeeTicket(req.user, ticket)) return res.status(403).json({ error: 'Not permitted' });
+  res.json(miData(req.params.ticketId));
 });
 
 // Declare a major incident: escalates to P1, sets commander + bridge,
@@ -57,6 +62,7 @@ router.get('/:ticketId', requireRole(...IT_ROLES), (req, res) => {
 router.post('/:ticketId/declare', requireRole('TEAM_LEAD', 'ADMIN'), (req, res) => {
   const ticket = getTicket(req.params.ticketId);
   if (!ticket) return res.status(404).json({ error: 'Ticket not found' });
+  if (!canSeeTicket(req.user, ticket)) return res.status(403).json({ error: 'Not permitted' });
   if (ticket.is_major) return res.status(400).json({ error: 'This ticket is already a major incident' });
   if (['RESOLVED', 'CLOSED'].includes(ticket.status)) {
     return res.status(400).json({ error: 'Resolved/closed tickets cannot be declared major' });
@@ -66,12 +72,18 @@ router.post('/:ticketId/declare', requireRole('TEAM_LEAD', 'ADMIN'), (req, res) 
     "SELECT * FROM users WHERE id = ? AND active = 1 AND role IN ('AGENT','TEAM_LEAD','ADMIN')"
   ).get(commander_id || req.user.id);
   if (!commander) return res.status(400).json({ error: 'Choose an active IT user as incident commander' });
+  // The bridge is rendered as a clickable link; only accept http(s) URLs so a
+  // javascript:/data: URL cannot be stored and clicked by responders.
+  const bridgeUrl = bridge ? String(bridge).trim() : '';
+  if (bridgeUrl && !/^https?:\/\/\S+$/i.test(bridgeUrl)) {
+    return res.status(400).json({ error: 'Bridge must be an http(s) URL' });
+  }
 
   db.prepare(`UPDATE tickets SET is_major = 1, major_commander_id = ?, major_bridge = ?,
       major_declared_at = datetime('now'), priority_id = 1,
       updated_at = datetime('now')
     WHERE id = ?`)
-    .run(commander.id, bridge || null, ticket.id);
+    .run(commander.id, bridgeUrl || null, ticket.id);
 
   ticketHistory(ticket.id, req.user.id, 'MAJOR_DECLARED',
     `Major incident declared. Commander: ${commander.full_name}. Priority escalated to P1.`);

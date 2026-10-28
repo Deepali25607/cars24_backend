@@ -24,7 +24,7 @@ const INT_FIELDS = new Set([
 ]);
 const ENUMS = {
   unknown_sender_action: ['QUARANTINE', 'REJECT'],
-  auth_check_mode: ['OFF', 'QUARANTINE_FAIL'],
+  auth_check_mode: ['OFF', 'QUARANTINE_FAIL', 'REQUIRE_PASS'],
   attachment_violation_action: ['QUARANTINE', 'STRIP'],
 };
 

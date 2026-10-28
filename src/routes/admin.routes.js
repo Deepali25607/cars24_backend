@@ -1,7 +1,7 @@
 const express = require('express');
 const bcrypt = require('bcryptjs');
 const { db } = require('../db');
-const { authenticate, requireRole } = require('../auth');
+const { authenticate, requireRole, generateTempPassword } = require('../auth');
 const { audit } = require('../services');
 
 const router = express.Router();
@@ -29,12 +29,15 @@ router.post('/users', (req, res) => {
   if (db.prepare('SELECT id FROM users WHERE email = ?').get(email)) {
     return res.status(409).json({ error: 'A user with this email already exists' });
   }
-  const pw = password && password.length >= 8 ? password : 'Welcome1!';
+  // A system-generated temporary password must be changed at first login; an
+  // admin-chosen explicit password is trusted as set.
+  const isTemp = !(password && password.length >= 8);
+  const pw = isTemp ? generateTempPassword() : password;
   const info = db.prepare(`INSERT INTO users
     (email, password_hash, full_name, role, department_id, location_id, support_group_id, phone, must_change_password)
-    VALUES (?,?,?,?,?,?,?,?,1)`)
+    VALUES (?,?,?,?,?,?,?,?,?)`)
     .run(email.trim(), bcrypt.hashSync(pw, 10), full_name.trim(), role,
-      department_id || null, location_id || null, support_group_id || null, phone || null);
+      department_id || null, location_id || null, support_group_id || null, phone || null, isTemp ? 1 : 0);
   audit(req.user.id, 'USER_CREATED', 'user', info.lastInsertRowid, email, req);
   res.status(201).json({ id: info.lastInsertRowid, temp_password: password ? undefined : pw });
 });
@@ -51,7 +54,7 @@ router.patch('/users/:id', (req, res) => {
   }
   let tempPassword;
   if (reset_password) {
-    tempPassword = 'Reset' + Math.random().toString(36).slice(2, 8) + '!';
+    tempPassword = generateTempPassword();
     db.prepare('UPDATE users SET password_hash = ?, must_change_password = 1 WHERE id = ?')
       .run(bcrypt.hashSync(tempPassword, 10), user.id);
   }

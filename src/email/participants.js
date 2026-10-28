@@ -153,11 +153,19 @@ function removeParticipants(ticketId, input, opts = {}) {
 // what the ticket says are the same thing. Anyone can be taken off again from
 // the ticket's Email participants card.
 function syncFromInbound(ticket, msg, config, { actorId = null, sender = null } = {}) {
+  const allowed = new Set((config.allowedDomains || []).map((d) => String(d).toLowerCase()));
   const candidates = [];
   for (const a of [...(msg.cc || []), ...(msg.to || [])]) {
     const address = String(a?.address || '').trim().toLowerCase();
     if (!address || address === sender) continue;
     if (config.systemAddresses.has(address)) continue;
+    // FR9: a reply can only add CC recipients on an allowed domain (or an
+    // already-registered user). This stops a forged/relayed mail silently
+    // subscribing arbitrary external addresses — each of which would then be
+    // emailed the whole conversation.
+    const domain = address.slice(address.lastIndexOf('@') + 1);
+    const isRegistered = !!db.prepare('SELECT 1 FROM users WHERE lower(email) = ? AND active = 1').get(address);
+    if (!allowed.has(domain) && !isRegistered) continue;
     candidates.push(address);
   }
   if (!candidates.length) return { ticket, added: [], skipped: [], invalid: [] };

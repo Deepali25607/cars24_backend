@@ -561,6 +561,9 @@ function ensureColumn(table, column, ddl) {
   const cols = db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name);
   if (!cols.includes(column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${ddl}`);
 }
+// Session revocation epoch: a JWT carries the epoch it was issued under; logout
+// and password change increment this so older tokens are rejected.
+ensureColumn('users', 'tokens_valid_after', 'tokens_valid_after INTEGER NOT NULL DEFAULT 0');
 ensureColumn('assets', 'status', "status TEXT NOT NULL DEFAULT 'IN_STOCK'");
 ensureColumn('assets', 'vendor', 'vendor TEXT');
 ensureColumn('assets', 'purchase_date', 'purchase_date TEXT');
@@ -649,7 +652,7 @@ CREATE TABLE IF NOT EXISTS email_channel_config (
   unknown_sender_action TEXT NOT NULL DEFAULT 'QUARANTINE'
     CHECK (unknown_sender_action IN ('QUARANTINE','REJECT')),
   auth_check_mode TEXT NOT NULL DEFAULT 'QUARANTINE_FAIL'
-    CHECK (auth_check_mode IN ('OFF','QUARANTINE_FAIL')),
+    CHECK (auth_check_mode IN ('OFF','QUARANTINE_FAIL','REQUIRE_PASS')),
   polling_interval_seconds INTEGER NOT NULL DEFAULT 60,
   reopen_window_days INTEGER NOT NULL DEFAULT 7,
   max_attachment_mb INTEGER NOT NULL DEFAULT 10,

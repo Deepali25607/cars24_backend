@@ -1,5 +1,6 @@
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 const { db } = require('./db');
 
 // ================= Automated database backup (BRD 6.14) =================
@@ -10,7 +11,10 @@ const { db } = require('./db');
 //   BACKUP_RETENTION_DAYS  prune backups older than this (default 14;
 //                          the customer-approved retention overrides it)
 
-const BACKUP_DIR = process.env.BACKUP_DIR || path.join(__dirname, '..', 'backups');
+// Default OUTSIDE the application folder so backups (which contain password and
+// token hashes) are never served by the app or swept into the repo. Production
+// should set BACKUP_DIR to a secured, backed-up volume.
+const BACKUP_DIR = process.env.BACKUP_DIR || path.join(os.tmpdir(), 'itsm-backups');
 const RETENTION_DAYS = Number(process.env.BACKUP_RETENTION_DAYS || 14);
 
 async function runBackup() {

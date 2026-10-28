@@ -43,6 +43,24 @@ function seed() {
 
   if (userCount > 0) return; // demo org data only on first run
 
+  // SECURITY: never create the shared-password demo accounts in production.
+  // Reference data (priorities/categories) above is still seeded. For a
+  // production bootstrap, create a single admin from ADMIN_EMAIL/ADMIN_PASSWORD
+  // (forced to change the password at first login). Without those, seed nothing
+  // and require the first admin to be provisioned out of band.
+  if (process.env.NODE_ENV === 'production') {
+    const email = (process.env.ADMIN_EMAIL || '').trim();
+    const password = process.env.ADMIN_PASSWORD || '';
+    if (email && password.length >= 8) {
+      db.prepare(`INSERT INTO users (email, password_hash, full_name, role, must_change_password)
+        VALUES (?,?,?,'ADMIN',1)`).run(email, bcrypt.hashSync(password, 10), process.env.ADMIN_NAME || 'Administrator');
+      console.log(`[seed] Production: created initial admin ${email} (must change password at first login).`);
+    } else {
+      console.warn('[seed] Production: no demo accounts seeded. Set ADMIN_EMAIL and ADMIN_PASSWORD (>=8 chars) to bootstrap the first admin.');
+    }
+    return;
+  }
+
   const dep = db.prepare('INSERT INTO departments (name) VALUES (?)');
   const depIds = {};
   for (const d of ['Engineering', 'Finance', 'Human Resources', 'Sales', 'IT Operations']) {

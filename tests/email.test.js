@@ -340,18 +340,24 @@ test('EM-9b reply to an incident RESOLVED longer than 7 days ago → new linked 
   ctx.linked = nt;
 });
 
-test('EM-9c reply to a CLOSED incident → new linked incident', async () => {
+test('EM-9c reply to a CLOSED incident within the window → reopened (same incident), no new ticket', async () => {
   await api(`/api/tickets/${ctx.hw.id}/status`, { method: 'POST', token: tokens.agent, body: { status: 'CLOSED' } });
   await runEmailJobs();
+  clearOutbox();
   const before = ticketCount();
   const r = await inbound({
     message_id: '<hw-closed@mail.cars24.com>', from_email: 'employee@itsm.local',
     subject: `RE: Laptop not charging [${ctx.hw.ticket_number}]`, body: 'One more thing.',
   });
-  assert.equal(r.status, 201);
-  assert.equal(r.data.linked_to, ctx.hw.ticket_number);
-  assert.equal(ticketCount(), before + 1);
-  assert.equal(ticketByNumber(ctx.hw.ticket_number).status, 'CLOSED');
+  assert.equal(r.status, 201, JSON.stringify(r.data));
+  assert.equal(r.data.reopened, true);
+  assert.equal(r.data.ticket_number, ctx.hw.ticket_number);
+  assert.equal(ticketCount(), before, 'no new incident created — the closed one is reopened');
+  const t = ticketByNumber(ctx.hw.ticket_number);
+  assert.equal(t.status, 'REOPENED');
+  const c = db.prepare('SELECT * FROM ticket_comments WHERE ticket_id = ? ORDER BY id DESC LIMIT 1').get(t.id);
+  assert.equal(c.body, 'One more thing.');
+  await runEmailJobs();
 });
 
 // ---------------- 10–11: loops, noise, idempotency ----------------
@@ -524,11 +530,15 @@ test('EM-15 unknown sender on an allowed domain → guest incident flagged for r
   assert.equal(lastMail().to, 'newjoiner@cars24.com');
   assert.match(lastMail().text, /Hello newjoiner@cars24\.com/);
   ctx.guest = t;
-  // reply from someone who is neither caller nor CC → flagged external
+  // SECURITY: a reply from someone who is neither the caller nor an existing
+  // participant must NOT be allowed to inject into the ticket — it is quarantined
+  // for review (previously any allowed-domain sender could comment on any INC).
   const ext = await inbound({ message_id: '<ext-r@mail>', from_email: 'rohit@itsm.local', subject: `RE: VPN access for new joiner [${t.ticket_number}]`, body: 'I can vouch for them.' });
-  assert.equal(ext.data.external_participant, true);
-  const c = db.prepare('SELECT external_participant FROM ticket_comments WHERE ticket_id = ? ORDER BY id DESC LIMIT 1').get(t.id);
-  assert.equal(c.external_participant, 1);
+  assert.equal(ext.status, 202);
+  assert.equal(ext.data.quarantined, true);
+  // No comment was added to the ticket by the non-participant.
+  const injected = db.prepare("SELECT COUNT(*) AS n FROM ticket_comments WHERE ticket_id = ? AND sender_email = 'rohit@itsm.local'").get(t.id).n;
+  assert.equal(injected, 0);
 });
 
 // ---------------- Admin API ----------------

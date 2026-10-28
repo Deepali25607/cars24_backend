@@ -1,5 +1,11 @@
 require('dotenv').config();
 
+// SECURITY: never run in production with a guessable, hard-coded JWT secret.
+if (process.env.NODE_ENV === 'production' && !process.env.JWT_SECRET) {
+  console.error('FATAL: JWT_SECRET must be set in production (refusing to start with the dev fallback).');
+  process.exit(1);
+}
+
 const { seed, seedStandard, seedAdvanced, seedEmailChannel } = require('./src/seed');
 seed();
 seedStandard();
@@ -26,6 +32,10 @@ require('./src/backup').startBackupTimer();
 // activates only when MAIL_IN_* is configured.
 require('./src/email/queue').startWorker(Number(process.env.EMAIL_WORKER_SECONDS || 30));
 require('./src/mailin').startMailPoller();
+
+// DEMO ONLY: local SMTP bridge (self-contained email demo without a real
+// mailbox). Starts only when MAIL_BRIDGE=1; never in production or tests.
+require('./src/mailbridge').startMailBridge();
 
 const sweepSeconds = Number(process.env.SLA_SWEEP_SECONDS || 60);
 setInterval(() => {

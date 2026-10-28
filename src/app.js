@@ -1,9 +1,13 @@
 const express = require('express');
 const cors = require('cors');
+const helmet = require('helmet');
 
 // Express app without the listener, so tests can mount it on an ephemeral port.
 function buildApp() {
   const app = express();
+  // Baseline security headers (no CSP here — this is a JSON API; the SPA sets
+  // its own CSP via vercel.json). nosniff, no framing, no referrer leakage.
+  app.use(helmet({ contentSecurityPolicy: false, crossOriginResourcePolicy: { policy: 'same-site' } }));
   // Known frontends are always allowed; CORS_ORIGIN (or CLIENT_ORIGIN) can add
   // more as a comma-separated list, e.g. "https://staging.example.com"
   const allowedOrigins = [
@@ -20,7 +24,10 @@ function buildApp() {
     },
   }));
   app.use(express.json({ limit: '1mb' }));
-  app.set('trust proxy', true);
+  // Trust only the actual number of proxy hops in front of the app (default 1,
+  // e.g. one load balancer / Vercel/Render edge). Setting `true` would let any
+  // client spoof its IP via X-Forwarded-For and poison the audit log.
+  app.set('trust proxy', Number(process.env.TRUST_PROXY_HOPS || 1));
 
   app.get('/api/health', (_req, res) => res.json({ ok: true, phase: 'ADVANCED' }));
 
@@ -51,8 +58,18 @@ function buildApp() {
     if (err.type === 'entity.parse.failed') {
       return res.status(400).json({ error: 'Invalid request body' });
     }
+    // CORS rejections are a client problem, not a server fault.
+    if (/not allowed by CORS/.test(err.message || '')) {
+      return res.status(403).json({ error: 'Origin not allowed' });
+    }
     console.error('[error]', err);
-    res.status(err.status || 500).json({ error: err.message || 'Unexpected server error' });
+    const status = err.status || err.statusCode || 500;
+    // Never leak internal error detail/stack to clients on a 5xx. Deliberate
+    // 4xx errors (with an explicit status) may carry a user-facing message.
+    if (status >= 500) {
+      return res.status(status).json({ error: 'Unexpected server error' });
+    }
+    res.status(status).json({ error: err.message || 'Request failed' });
   });
 
   return app;

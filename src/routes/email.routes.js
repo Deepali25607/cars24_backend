@@ -24,7 +24,11 @@ const LOG_SELECT = `
   FROM email_message_log l LEFT JOIN tickets t ON t.id = l.ticket_id`;
 
 // ---------- Per-ticket thread (IT users) ----------
+const { canSeeTicket } = require('../ticketAccess');
 router.get('/ticket/:id', requireRole(...IT_ROLES), (req, res) => {
+  const ticket = db.prepare('SELECT id, requester_id, assigned_agent_id, support_group_id, cc_list FROM tickets WHERE id = ?').get(req.params.id);
+  if (!ticket) return res.status(404).json({ error: 'Ticket not found' });
+  if (!canSeeTicket(req.user, ticket)) return res.status(403).json({ error: 'Not permitted' });
   res.json(db.prepare(`${LOG_SELECT} WHERE l.ticket_id = ? ORDER BY l.id ASC`).all(req.params.id));
 });
 
