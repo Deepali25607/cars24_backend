@@ -43,12 +43,13 @@ function seed() {
 
   if (userCount > 0) return; // demo org data only on first run
 
-  // SECURITY: never create the shared-password demo accounts in production.
-  // Reference data (priorities/categories) above is still seeded. For a
-  // production bootstrap, create a single admin from ADMIN_EMAIL/ADMIN_PASSWORD
-  // (forced to change the password at first login). Without those, seed nothing
-  // and require the first admin to be provisioned out of band.
-  if (process.env.NODE_ENV === 'production') {
+  // SECURITY: never create the shared-password demo accounts in production —
+  // UNLESS the operator explicitly opts in with SEED_DEMO_DATA=1 (for a sandbox
+  // / client-demo deployment). Reference data (priorities/categories) above is
+  // always seeded. For a real production bootstrap, create a single admin from
+  // ADMIN_EMAIL/ADMIN_PASSWORD (forced to change the password at first login);
+  // without those, seed nothing and provision the first admin out of band.
+  if (process.env.NODE_ENV === 'production' && process.env.SEED_DEMO_DATA !== '1') {
     const email = (process.env.ADMIN_EMAIL || '').trim();
     const password = process.env.ADMIN_PASSWORD || '';
     if (email && password.length >= 8) {
